@@ -38,7 +38,7 @@ app.post('/api/groups', (req, res) => {
     inviteCode,
     createdAt: Date.now(),          // 30분 만료 계산에 씀 (다음 단계)
     hostVehicleId: vehicleId,       // 만든 차량 = 호스트
-    vehicles: new Map([[vehicleId, { vehicleId, vehicleName }]]),
+    vehicles: new Map([[vehicleId, { vehicleId, vehicleName, status: null }]]), // status: 마지막 차량 상태
   });
   codeToGroup.set(inviteCode, groupId);
 
@@ -77,7 +77,7 @@ app.post('/api/groups/join', (req, res) => {
 
   // 통과하면 참가 목록에 추가
   const vehicleId = 'v' + (++vehicleSeq);
-  group.vehicles.set(vehicleId, { vehicleId, vehicleName });
+  group.vehicles.set(vehicleId, { vehicleId, vehicleName, status: null });
 
   res.json({ groupId, vehicleId, vehicles: vehicleNames(group) });
   broadcastGroupState(groupId); // 이미 연결된 차량들에게 새 명단 알림
@@ -106,7 +106,8 @@ app.use((err, req, res, next) => {
 // ── 실시간 연결 (WebSocket) ──
 // REST와 같은 서버·포트(3000)를 같이 쓴다
 const server = app.listen(3000, '0.0.0.0', () => console.log('서버 시작!'));
-const wss = new WebSocketServer({ server });
+// maxPayload: 메시지 1개 최대 16KB. 기본값(100MB)이면 큰 데이터 한 방에 메모리가 터질 수 있음
+const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 const sockets = new Map(); // groupId → Set<ws> (그 동행에 연결된 앱들)
 
 // 한 연결에 JSON 보내기
@@ -126,6 +127,76 @@ function broadcastGroupState(groupId) {
   if (!group || !set) return;
   const msg = { type: 'group_state', groupId, vehicles: vehicleNames(group) };
   for (const ws of set) send(ws, msg);
+}
+
+// ── 연습용 차량 상태 (vehicle_status) ──
+// 실제 차량 SDK 값이 아니라 버튼·테스트로 보내는 연습용 값이다
+const STATUS_MAX_PER_SEC = 20;             // 한 연결이 1초에 20번 넘게 보내면 거절 (도배 방지, 가정)
+const WARNING_PATTERN = /^[A-Z0-9_]{1,32}$/; // warning은 "NONE", "TIRE_LOW" 같은 대문자 코드만 (제안)
+
+// data 검사: 문제가 있으면 { error }를, 통과하면 { value }를 돌려준다
+// 알려진 칸(ready, warning)만 골라 담는다 → 이상한 칸이 다른 차로 퍼지지 않음
+function validateStatus(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    return { error: 'data는 { "ready": true, "warning": "NONE" } 형태여야 합니다' };
+  }
+  const value = {};
+  if ('ready' in data) {
+    if (typeof data.ready !== 'boolean') return { error: 'ready는 true 또는 false여야 합니다' };
+    value.ready = data.ready;
+  }
+  if ('warning' in data) {
+    if (typeof data.warning !== 'string' || !WARNING_PATTERN.test(data.warning)) {
+      return { error: 'warning은 NONE 같은 대문자 코드여야 합니다 (A-Z, 0-9, _ 최대 32자)' };
+    }
+    value.warning = data.warning;
+  }
+  if (Object.keys(value).length === 0) return { error: 'ready나 warning 중 하나는 있어야 합니다' };
+  return { value };
+}
+
+// 같은 동행의 다른 연결들에게만 보내기 (보낸 사람 제외)
+function broadcastExcept(groupId, exceptWs, obj) {
+  const set = sockets.get(groupId);
+  if (!set) return;
+  for (const ws of set) if (ws !== exceptWs) send(ws, obj);
+}
+
+function statusMessage(groupId, vehicle) {
+  return {
+    type: 'vehicle_status_updated',
+    groupId,
+    vehicleId: vehicle.vehicleId,
+    vehicleName: vehicle.vehicleName, // 앱은 명단을 이름으로 보여주므로 이름도 같이 보낸다
+    data: vehicle.status,
+  };
+}
+
+function handleVehicleStatus(ws, msg) {
+  if (!ws.groupId) {
+    return sendError(ws, 'NOT_JOINED', '먼저 join으로 동행에 연결하세요');
+  }
+  // 누가 보냈는지는 메시지 안의 vehicleId가 아니라 join 때 확인된 값으로 정한다 (다른 차 사칭 방지)
+  if (msg.vehicleId !== undefined && msg.vehicleId !== ws.vehicleId) {
+    return sendError(ws, 'BAD_STATUS', '다른 차량의 상태는 보낼 수 없습니다');
+  }
+  // 1초 단위로 보낸 횟수를 센다. 넘치면 버리지 않고 에러로 알린다 (마지막 상태가 조용히 사라지는 것 방지)
+  const now = Date.now();
+  if (!ws.rate || now - ws.rate.start >= 1000) ws.rate = { start: now, count: 0 };
+  if (++ws.rate.count > STATUS_MAX_PER_SEC) {
+    return sendError(ws, 'RATE_LIMITED', '상태를 너무 자주 보냈습니다. 잠시 후 다시 보내세요');
+  }
+
+  const checked = validateStatus(msg.data);
+  if (checked.error) return sendError(ws, 'BAD_STATUS', checked.error);
+
+  const group = groups.get(ws.groupId);
+  const vehicle = group && group.vehicles.get(ws.vehicleId);
+  if (!vehicle) return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다');
+
+  // 보낸 칸만 덮어쓴다 (ready만 보내면 warning은 이전 값 유지)
+  vehicle.status = { ...(vehicle.status || {}), ...checked.value };
+  broadcastExcept(ws.groupId, ws, statusMessage(ws.groupId, vehicle));
 }
 
 // 이 연결을 지금 동행의 알림 대상에서 빼기 (방을 바꾸거나, 나가거나, 끊길 때)
@@ -162,7 +233,15 @@ function handleMessage(ws, raw) {
     if (!sockets.has(ws.groupId)) sockets.set(ws.groupId, new Set());
     sockets.get(ws.groupId).add(ws);
     send(ws, { type: 'group_state', groupId: ws.groupId, vehicles: vehicleNames(group) });
+    // 늦게 들어온 차도 다른 차들의 마지막 상태를 바로 알 수 있게
+    for (const v of group.vehicles.values()) {
+      if (v.vehicleId !== ws.vehicleId && v.status) send(ws, statusMessage(ws.groupId, v));
+    }
     return;
+  }
+
+  if (msg.type === 'vehicle_status') {
+    return handleVehicleStatus(ws, msg);
   }
 
   if (msg.type === 'leave') {
