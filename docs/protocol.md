@@ -32,11 +32,14 @@
 | --- | --- | --- | --- |
 | 앱→서버 | `join` | groupId, vehicleId | 연결 직후. 실시간 알림 등록용이며 동행 참가 자체는 REST join이 담당 |
 | 서버→앱 | `group_state` | vehicles | 참가 차량 목록이 바뀔 때 해당 동행 연결 전체에 |
+| 서버→앱 | `group_state` | vehicles | `join` 직후 그 연결에 1회 (현재 명단, 제안) |
+| 서버→앱 | `error` | error, message | 잘못된 메시지. `BAD_JSON` / `NOT_A_MEMBER`(REST 참가 안 한 vehicleId) / `UNKNOWN_TYPE` (제안) |
 | 앱→서버 | `vehicle_status` | vehicleId, data `{ready, warning}` | 상태 변경 시 |
 | 서버→앱 | `vehicle_status_updated` | vehicleId, data `{ready, warning}` | 다른 차량이 vehicle_status를 보냈을 때 같은 동행에 |
 
 - 1차의 `ready`/`warning`은 **연습용 값**이다 (예: `ready:true`, `warning:"NONE"`). 차량 SDK에서 읽은 값이 아니다.
 - 연결이 끊겨도 동행에서 바로 빼지 않는다.
+- 테스트: `server/ws-test.js` (`node ws-test.js g1 v1`). 다른 PC면 `WS_URL=ws://<IP>:3000 node ws-test.js g1 v1`
 
 ## 서버 저장
 1차는 서버 메모리(Map)에 저장. 서버를 끄면 사라진다. DB·배포는 1차 범위 밖.
