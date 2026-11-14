@@ -13,7 +13,7 @@
 | POST /api/groups/join | `{"inviteCode":"384271","vehicleName":"2호차"}` | `{"groupId":"g1","vehicleId":"v2","vehicles":["1호차","2호차"]}` |
 | GET /api/groups/:groupId | - | `{"groupId":"g1","vehicles":["1호차","2호차"]}` (제안) |
 
-- inviteCode: 무작위 6자리 숫자. 사용 중인 코드와 겹치면 다시 뽑는다.
+- inviteCode: 무작위 6자리 숫자. 사용 중인 코드와 겹치면 다시 뽑는다. **문자열**로 주고받는다 (`"012345"`처럼 0으로 시작할 수 있어 숫자로 바꾸면 앞자리 0이 사라짐).
 - 동행을 만든 차량이 호스트이며 참가 목록에 바로 들어간다.
 - 참가 거절 조건
   - 없는 코드
@@ -21,6 +21,7 @@
   - 인원 초과: 최대 5대 (가정)
 - 거절 응답 형식 (제안): HTTP 4xx + `{"error":"<코드>","message":"<설명>"}`
   - 404 `INVALID_CODE` / 410 `CODE_EXPIRED` / 409 `GROUP_FULL`
+  - 400 `MISSING_VEHICLE_NAME`: 만들기·참가 요청에 vehicleName이 없을 때 (제안)
 
 ## WebSocket
 접속 주소 (제안): `ws://<서버 IP>:3000` — REST와 같은 서버·포트
