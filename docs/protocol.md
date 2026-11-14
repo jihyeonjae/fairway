@@ -22,6 +22,7 @@
 - 거절 응답 형식 (제안): HTTP 4xx + `{"error":"<코드>","message":"<설명>"}`
   - 404 `INVALID_CODE` / 410 `CODE_EXPIRED` / 409 `GROUP_FULL`
   - 400 `MISSING_VEHICLE_NAME`: 만들기·참가 요청에 vehicleName이 없을 때 (제안)
+  - 404 `GROUP_NOT_FOUND`: GET /api/groups/:groupId 에서 없는 groupId (제안)
 
 ## WebSocket
 접속 주소 (제안): `ws://<서버 IP>:3000` — REST와 같은 서버·포트
