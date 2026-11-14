@@ -133,6 +133,8 @@ function broadcastGroupState(groupId) {
 // 실제 차량 SDK 값이 아니라 버튼·테스트로 보내는 연습용 값이다
 const STATUS_MAX_PER_SEC = 20;             // 한 연결이 1초에 20번 넘게 보내면 거절 (도배 방지, 가정)
 const WARNING_PATTERN = /^[A-Z0-9_]{1,32}$/; // warning은 "NONE", "TIRE_LOW" 같은 대문자 코드만 (제안)
+// 아직 보내지 않은 칸의 기본값. 앱이 항상 두 칸을 다 받도록 서버가 채운다
+const DEFAULT_STATUS = { ready: false, warning: 'NONE' };
 
 // data 검사: 문제가 있으면 { error }를, 통과하면 { value }를 돌려준다
 // 알려진 칸(ready, warning)만 골라 담는다 → 이상한 칸이 다른 차로 퍼지지 않음
@@ -194,8 +196,9 @@ function handleVehicleStatus(ws, msg) {
   const vehicle = group && group.vehicles.get(ws.vehicleId);
   if (!vehicle) return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다');
 
-  // 보낸 칸만 덮어쓴다 (ready만 보내면 warning은 이전 값 유지)
-  vehicle.status = { ...(vehicle.status || {}), ...checked.value };
+  // 기본값 → 이전 값 → 이번에 보낸 칸 순서로 덮어쓴다
+  // ready만 보내면 warning은 이전 값 유지, 처음이면 기본값 → 항상 ready·warning 둘 다 있음
+  vehicle.status = { ...DEFAULT_STATUS, ...(vehicle.status || {}), ...checked.value };
   broadcastExcept(ws.groupId, ws, statusMessage(ws.groupId, vehicle));
 }
 
