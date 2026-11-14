@@ -22,6 +22,7 @@
 - 거절 응답 형식 (제안): HTTP 4xx + `{"error":"<코드>","message":"<설명>"}`
   - 404 `INVALID_CODE` / 410 `CODE_EXPIRED` / 409 `GROUP_FULL`
   - 400 `MISSING_VEHICLE_NAME`: 만들기·참가 요청에 vehicleName이 없을 때 (제안)
+  - 400 `BAD_JSON`: 요청 본문이 JSON이 아닐 때 / 500 `SERVER_ERROR`: 서버 내부 오류 (제안)
   - 404 `GROUP_NOT_FOUND`: GET /api/groups/:groupId 에서 없는 groupId (제안)
 
 ## WebSocket
@@ -31,15 +32,26 @@
 | 방향 | type | 필드 | 보내는 때 |
 | --- | --- | --- | --- |
 | 앱→서버 | `join` | groupId, vehicleId | 연결 직후. 실시간 알림 등록용이며 동행 참가 자체는 REST join이 담당 |
-| 서버→앱 | `group_state` | vehicles | 참가 차량 목록이 바뀔 때 해당 동행 연결 전체에 |
-| 서버→앱 | `group_state` | vehicles | `join` 직후 그 연결에 1회 (현재 명단, 제안) |
-| 서버→앱 | `error` | error, message | 잘못된 메시지. `BAD_JSON` / `NOT_A_MEMBER`(REST 참가 안 한 vehicleId) / `UNKNOWN_TYPE` (제안) |
-| 앱→서버 | `vehicle_status` | vehicleId, data `{ready, warning}` | 상태 변경 시 |
-| 서버→앱 | `vehicle_status_updated` | vehicleId, data `{ready, warning}` | 다른 차량이 vehicle_status를 보냈을 때 같은 동행에 |
+| 앱→서버 | `leave` | - | 방을 나가거나 바꿀 때. 알림만 끊고 동행 명단에서는 빼지 않음 |
+| 서버→앱 | `group_state` | groupId, vehicles | 참가 차량 목록이 바뀔 때 해당 동행 연결 전체에 |
+| 서버→앱 | `group_state` | groupId, vehicles | `join` 직후 그 연결에 1회 (현재 명단, 제안) |
+| 서버→앱 | `error` | error, message | 잘못된 메시지를 보낸 연결에만. `BAD_JSON` / `BAD_MESSAGE`(객체가 아님) / `NOT_A_MEMBER`(REST 참가 안 한 vehicleId) / `NOT_JOINED` / `BAD_STATUS` / `RATE_LIMITED` / `UNKNOWN_TYPE` / `SERVER_ERROR` (제안). 앱은 message를 토스트로 표시 |
+| 앱→서버 | `vehicle_status` | data `{ready?, warning?}`, vehicleId(생략 가능) | 상태 변경 시. 보낸 칸만 갱신 |
+| 서버→앱 | `vehicle_status_updated` | groupId, vehicleId, vehicleName, data `{ready, warning}` | 다른 차량이 vehicle_status를 보냈을 때 같은 동행의 **보낸 차량 제외** 전체에. `join` 직후에도 다른 차들의 마지막 상태를 1회씩 |
 
 - 1차의 `ready`/`warning`은 **연습용 값**이다 (예: `ready:true`, `warning:"NONE"`). 차량 SDK에서 읽은 값이 아니다.
+- `vehicle_status` 검사 (실패 시 보낸 연결에만 `error`, 다른 차로는 안 퍼짐)
+  - `NOT_JOINED`: join 전이거나 leave 후에 보냄
+  - `BAD_STATUS`: data가 객체가 아님 / ready가 true·false가 아님 / warning이 대문자 코드(`A-Z 0-9 _`, 32자 이하)가 아님 / 둘 다 없음 / 메시지의 vehicleId가 join한 차량과 다름
+  - `RATE_LIMITED`: 한 연결이 1초에 20번 넘게 보냄 (가정)
+  - ready·warning 외의 칸은 버리고 전달하지 않는다
+- `vehicle_status_updated.data`에는 **항상 `ready`와 `warning`이 둘 다** 들어 있다. 아직 안 보낸 칸은 기본값(`ready:false`, `warning:"NONE"`)으로 서버가 채운다
+- 보낸 차량은 자기 상태를 돌려받지 않는다 (앱이 자기 화면은 직접 갱신)
+- 메시지 1개 최대 16KB. 넘으면 서버가 연결을 끊는다 (close 코드 1009)
 - 연결이 끊겨도 동행에서 바로 빼지 않는다.
-- 테스트: `server/ws-test.js` (`node ws-test.js g1 v1`). 다른 PC면 `WS_URL=ws://<IP>:3000 node ws-test.js g1 v1`
+- 한 연결로 다른 동행에 `join`하면 이전 동행 알림은 자동으로 끊긴다. 앱이 방을 바꿀 때 **새 연결을 만들면 이전 연결은 반드시 close** 해야 한다 (서버는 두 연결이 같은 기기인지 모름).
+- 앱은 `group_state.groupId`가 현재 방과 다르면 무시한다.
+- 테스트: `server/ws-test.js` (`node ws-test.js g1 v1`). 연결 후 `r`/`n`/`w 코드`/`{JSON}`/`leave` 입력. 다른 PC면 `WS_URL=ws://<IP>:3000 node ws-test.js g1 v1`
 
 ## 서버 저장
 1차는 서버 메모리(Map)에 저장. 서버를 끄면 사라진다. DB·배포는 1차 범위 밖.
