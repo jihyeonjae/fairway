@@ -92,6 +92,17 @@ app.get('/api/groups/:groupId', (req, res) => {
   res.json({ groupId: group.groupId, vehicles: vehicleNames(group) });
 });
 
+// ── REST 에러 처리 ──
+// 깨진 JSON 등으로 Express 안에서 에러가 나면 HTML 대신 JSON으로 답한다 (앱이 토스트로 띄울 수 있게)
+// 에러 처리 미들웨어는 인자가 4개여야 하고, 모든 라우트 뒤에 둔다
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'BAD_JSON', message: 'JSON 형식이 아닙니다' });
+  }
+  console.error('[REST 에러]', err);
+  res.status(500).json({ error: 'SERVER_ERROR', message: '서버 처리 중 오류가 났습니다' });
+});
+
 // ── 실시간 연결 (WebSocket) ──
 // REST와 같은 서버·포트(3000)를 같이 쓴다
 const server = app.listen(3000, '0.0.0.0', () => console.log('서버 시작!'));
@@ -103,47 +114,84 @@ function send(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
+// 에러를 보낸 앱에게만 돌려주기 (앱은 message를 토스트로 띄움)
+function sendError(ws, error, message) {
+  send(ws, { type: 'error', error, message });
+}
+
 // 그 동행에 연결된 모든 앱에게 현재 명단 보내기
 function broadcastGroupState(groupId) {
   const group = groups.get(groupId);
   const set = sockets.get(groupId);
   if (!group || !set) return;
-  const msg = { type: 'group_state', vehicles: vehicleNames(group) };
+  const msg = { type: 'group_state', groupId, vehicles: vehicleNames(group) };
   for (const ws of set) send(ws, msg);
 }
 
+// 이 연결을 지금 동행의 알림 대상에서 빼기 (방을 바꾸거나, 나가거나, 끊길 때)
+function detach(ws) {
+  const set = sockets.get(ws.groupId);
+  if (set) {
+    set.delete(ws);
+    if (set.size === 0) sockets.delete(ws.groupId);
+  }
+  ws.groupId = null;
+  ws.vehicleId = null;
+}
+
+function handleMessage(ws, raw) {
+  let msg;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return sendError(ws, 'BAD_JSON', 'JSON 형식이 아닙니다');
+  }
+  // null, 숫자, 문자열, 배열은 거절 ({ ... } 모양만 받는다)
+  if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
+    return sendError(ws, 'BAD_MESSAGE', '메시지는 { "type": ... } 형태여야 합니다');
+  }
+
+  if (msg.type === 'join') {
+    const group = groups.get(msg.groupId);
+    if (!group || !group.vehicles.has(msg.vehicleId)) {
+      return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다. REST로 먼저 참가하세요');
+    }
+    detach(ws); // 이미 다른 동행에 등록돼 있으면 먼저 뺀다 → 이전 동행 소식이 안 옴
+    ws.groupId = msg.groupId;
+    ws.vehicleId = msg.vehicleId;
+    if (!sockets.has(ws.groupId)) sockets.set(ws.groupId, new Set());
+    sockets.get(ws.groupId).add(ws);
+    send(ws, { type: 'group_state', groupId: ws.groupId, vehicles: vehicleNames(group) });
+    return;
+  }
+
+  if (msg.type === 'leave') {
+    detach(ws); // 알림만 끊는다. 동행 명단에서 빼는 건 아님
+    return;
+  }
+
+  sendError(ws, 'UNKNOWN_TYPE', `모르는 type입니다: ${msg.type}`);
+}
+
 wss.on('connection', (ws) => {
-  // 이 연결이 어느 동행·어느 차량인지 (join을 받으면 채움)
   ws.groupId = null;
   ws.vehicleId = null;
 
   ws.on('message', (raw) => {
-    let msg;
     try {
-      msg = JSON.parse(raw);
-    } catch {
-      return send(ws, { type: 'error', error: 'BAD_JSON', message: 'JSON 형식이 아닙니다' });
+      handleMessage(ws, raw);
+    } catch (e) {
+      // 예상 못 한 에러가 나도 서버는 계속 돈다
+      console.error('[WS 처리 에러]', e);
+      sendError(ws, 'SERVER_ERROR', '서버 처리 중 오류가 났습니다');
     }
-
-    if (msg.type === 'join') {
-      const group = groups.get(msg.groupId);
-      if (!group || !group.vehicles.has(msg.vehicleId)) {
-        return send(ws, { type: 'error', error: 'NOT_A_MEMBER', message: '동행에 참가한 차량이 아닙니다. REST로 먼저 참가하세요' });
-      }
-      ws.groupId = msg.groupId;
-      ws.vehicleId = msg.vehicleId;
-      if (!sockets.has(ws.groupId)) sockets.set(ws.groupId, new Set());
-      sockets.get(ws.groupId).add(ws);
-      send(ws, { type: 'group_state', vehicles: vehicleNames(group) }); // 연결 직후 현재 명단 1회
-      return;
-    }
-
-    send(ws, { type: 'error', error: 'UNKNOWN_TYPE', message: `모르는 type입니다: ${msg.type}` });
   });
+
+  // 깨진 프레임 등 연결 자체의 에러. 이 리스너가 없으면 서버 전체가 꺼진다
+  ws.on('error', (e) => console.error('[WS 연결 에러]', e.message));
 
   // 연결이 끊기면 알림 대상에서만 뺀다 (동행에서 탈퇴시키지는 않음)
-  ws.on('close', () => {
-    const set = sockets.get(ws.groupId);
-    if (set) set.delete(ws);
-  });
+  ws.on('close', () => detach(ws));
 });
+
+wss.on('error', (e) => console.error('[WS 서버 에러]', e.message));
