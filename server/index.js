@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const { WebSocketServer } = require('ws');
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -79,6 +80,7 @@ app.post('/api/groups/join', (req, res) => {
   group.vehicles.set(vehicleId, { vehicleId, vehicleName });
 
   res.json({ groupId, vehicleId, vehicles: vehicleNames(group) });
+  broadcastGroupState(groupId); // 이미 연결된 차량들에게 새 명단 알림
 });
 
 // ── 참가 차량 목록 보기 ──
@@ -90,4 +92,58 @@ app.get('/api/groups/:groupId', (req, res) => {
   res.json({ groupId: group.groupId, vehicles: vehicleNames(group) });
 });
 
-app.listen(3000, '0.0.0.0', () => console.log('서버 시작!'));
+// ── 실시간 연결 (WebSocket) ──
+// REST와 같은 서버·포트(3000)를 같이 쓴다
+const server = app.listen(3000, '0.0.0.0', () => console.log('서버 시작!'));
+const wss = new WebSocketServer({ server });
+const sockets = new Map(); // groupId → Set<ws> (그 동행에 연결된 앱들)
+
+// 한 연결에 JSON 보내기
+function send(ws, obj) {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// 그 동행에 연결된 모든 앱에게 현재 명단 보내기
+function broadcastGroupState(groupId) {
+  const group = groups.get(groupId);
+  const set = sockets.get(groupId);
+  if (!group || !set) return;
+  const msg = { type: 'group_state', vehicles: vehicleNames(group) };
+  for (const ws of set) send(ws, msg);
+}
+
+wss.on('connection', (ws) => {
+  // 이 연결이 어느 동행·어느 차량인지 (join을 받으면 채움)
+  ws.groupId = null;
+  ws.vehicleId = null;
+
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return send(ws, { type: 'error', error: 'BAD_JSON', message: 'JSON 형식이 아닙니다' });
+    }
+
+    if (msg.type === 'join') {
+      const group = groups.get(msg.groupId);
+      if (!group || !group.vehicles.has(msg.vehicleId)) {
+        return send(ws, { type: 'error', error: 'NOT_A_MEMBER', message: '동행에 참가한 차량이 아닙니다. REST로 먼저 참가하세요' });
+      }
+      ws.groupId = msg.groupId;
+      ws.vehicleId = msg.vehicleId;
+      if (!sockets.has(ws.groupId)) sockets.set(ws.groupId, new Set());
+      sockets.get(ws.groupId).add(ws);
+      send(ws, { type: 'group_state', vehicles: vehicleNames(group) }); // 연결 직후 현재 명단 1회
+      return;
+    }
+
+    send(ws, { type: 'error', error: 'UNKNOWN_TYPE', message: `모르는 type입니다: ${msg.type}` });
+  });
+
+  // 연결이 끊기면 알림 대상에서만 뺀다 (동행에서 탈퇴시키지는 않음)
+  ws.on('close', () => {
+    const set = sockets.get(ws.groupId);
+    if (set) set.delete(ws);
+  });
+});
