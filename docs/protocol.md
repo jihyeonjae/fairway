@@ -45,6 +45,7 @@
   - `BAD_STATUS`: data가 객체가 아님 / ready가 true·false가 아님 / warning이 대문자 코드(`A-Z 0-9 _`, 32자 이하)가 아님 / 둘 다 없음 / 메시지의 vehicleId가 join한 차량과 다름
   - `RATE_LIMITED`: 한 연결이 1초에 20번 넘게 보냄 (가정)
   - ready·warning 외의 칸은 버리고 전달하지 않는다
+- `vehicle_status_updated.data`에는 **항상 `ready`와 `warning`이 둘 다** 들어 있다. 아직 안 보낸 칸은 기본값(`ready:false`, `warning:"NONE"`)으로 서버가 채운다
 - 보낸 차량은 자기 상태를 돌려받지 않는다 (앱이 자기 화면은 직접 갱신)
 - 메시지 1개 최대 16KB. 넘으면 서버가 연결을 끊는다 (close 코드 1009)
 - 연결이 끊겨도 동행에서 바로 빼지 않는다.
