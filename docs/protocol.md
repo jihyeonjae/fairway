@@ -14,6 +14,7 @@
 | POST /api/groups/join | `{"inviteCode":"384271","vehicleName":"2호차"}` | `{"groupId":"g1","vehicleId":"v2","vehicles":["1호차","2호차"]}` |
 | GET /api/groups/:groupId | - | `{"groupId":"g1","vehicles":["1호차","2호차"]}` (제안) |
 
+- groupId·vehicleId: 서버가 만드는 **무작위 문자열**(예: `g3f9a1c0b7e2d`, `v74890ffb19a5`). 표의 `g1`·`v1`은 설명용 예시다. 앱은 형식·길이에 의존하지 말고 받은 문자열을 그대로 저장한다. 서버를 재시작하면 예전 ID는 모두 무효가 된다(`NOT_A_MEMBER`)
 - inviteCode: 무작위 6자리 숫자. 사용 중인 코드와 겹치면 다시 뽑는다. **문자열**로 주고받는다 (`"012345"`처럼 0으로 시작할 수 있어 숫자로 바꾸면 앞자리 0이 사라짐).
 - 동행을 만든 차량이 호스트이며 참가 목록에 바로 들어간다.
 - 참가 거절 조건
@@ -58,7 +59,7 @@
 - 한 연결로 다른 동행에 `join`하면 이전 동행 알림은 자동으로 끊긴다. 앱이 방을 바꿀 때 **새 연결을 만들면 이전 연결은 반드시 close** 해야 한다 (서버는 두 연결이 같은 기기인지 모름).
 - 앱은 `group_state.groupId`가 현재 방과 다르면 무시한다.
 - 자동 테스트: `server/e2e-test.js` (전체), `server/expire-test.js` (코드 만료, 서버를 `CODE_TTL_MS=2000`으로 켜고 실행)
-- 수동 테스트: `server/ws-test.js` (`node ws-test.js g1 v1`). 연결 후 `r`/`n`/`w 코드`/`{JSON}`/`leave` 입력. 다른 PC면 `WS_URL=ws://<IP>:3000 node ws-test.js g1 v1`
+- 수동 테스트: `server/ws-test.js` (`node ws-test.js <groupId> <vehicleId>`, ID는 REST 응답값). 연결 후 `r`/`n`/`w 코드`/`{JSON}`/`leave` 입력. 다른 PC면 `WS_URL=ws://<IP>:3000 node ws-test.js <groupId> <vehicleId>`
 
 ## 서버 저장
 1차는 서버 메모리(Map)에 저장. 서버를 끄면 사라진다. DB·배포는 1차 범위 밖.

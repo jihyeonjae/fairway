@@ -20,8 +20,12 @@ app.use(express.json());
 // ── 메모리 저장소 (서버 끄면 사라짐) ──
 const groups = new Map();      // groupId → 동행 정보
 const codeToGroup = new Map(); // inviteCode → groupId (코드로 동행 찾기용)
-let groupSeq = 0;              // g1, g2, ... 만들 때 쓰는 번호
-let vehicleSeq = 0;            // v1, v2, ... 동행이 달라도 서버 전체에서 겹치지 않음
+// ID는 무작위로 만든다. 순번(g1, v2)이면 서버를 재시작했을 때 번호가 1부터 다시 시작해서,
+// 앱이 저장해 둔 예전 ID가 새로 생긴 다른 차량 ID와 겹쳐 남의 차로 접속될 수 있다
+const crypto = require('crypto');
+function newId(prefix) {
+  return prefix + crypto.randomBytes(6).toString('hex'); // 예: g3f9a1c0b7e2d
+}
 
 // 6자리 코드 만들기. 이미 쓰는 코드면 다시 뽑는다
 function newInviteCode() {
@@ -50,8 +54,8 @@ app.post('/api/groups', (req, res) => {
     return res.status(400).json({ error: 'MISSING_VEHICLE_NAME', message: 'vehicleName은 1~20자 문자열이어야 합니다' });
   }
 
-  const groupId = 'g' + (++groupSeq);
-  const vehicleId = 'v' + (++vehicleSeq);
+  const groupId = newId('g');
+  const vehicleId = newId('v');
   const inviteCode = newInviteCode();
 
   groups.set(groupId, {
@@ -102,7 +106,7 @@ app.post('/api/groups/join', (req, res) => {
   }
 
   // 통과하면 참가 목록에 추가
-  const vehicleId = 'v' + (++vehicleSeq);
+  const vehicleId = newId('v');
   group.vehicles.set(vehicleId, { vehicleId, vehicleName, status: null });
 
   res.json({ groupId, vehicleId, vehicles: vehicleNames(group) });
