@@ -1,3 +1,15 @@
+const path = require('path');
+const fs = require('fs');
+
+// ── 설정 읽기 ──
+// env/.env 가 있으면 읽는다 (없으면 기본값). 형식은 env/.env.example 참고
+// 이미 터미널에서 준 환경변수(SERVER_PORT=4000 node index.js)가 파일보다 우선
+const ENV_FILE = path.join(__dirname, '..', 'env', '.env');
+if (fs.existsSync(ENV_FILE) && typeof process.loadEnvFile === 'function') {
+  process.loadEnvFile(ENV_FILE); // Node 20.12+ 내장 기능
+}
+const PORT = Number(process.env.SERVER_PORT) || 3000;
+
 const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
@@ -118,8 +130,16 @@ app.use((err, req, res, next) => {
 });
 
 // ── 실시간 연결 (WebSocket) ──
-// REST와 같은 서버·포트(3000)를 같이 쓴다
-const server = app.listen(3000, '0.0.0.0', () => console.log('서버 시작!'));
+// REST와 같은 서버·포트(SERVER_PORT, 기본 3000)를 같이 쓴다
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`서버 시작! 포트 ${PORT}`));
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`포트 ${PORT}을 이미 다른 프로그램이 쓰고 있습니다. 켜져 있는 서버를 끄거나 SERVER_PORT를 바꾸세요`);
+  } else {
+    console.error('[서버 시작 에러]', e.message);
+  }
+  process.exit(1);
+});
 // maxPayload: 메시지 1개 최대 16KB. 기본값(100MB)이면 큰 데이터 한 방에 메모리가 터질 수 있음
 const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 const sockets = new Map(); // groupId → Set<ws> (그 동행에 연결된 앱들)

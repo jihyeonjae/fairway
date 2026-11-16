@@ -153,6 +153,16 @@ async function main() {
   const longName = await api('POST', '/api/groups', { vehicleName: 'x'.repeat(21) });
   check('21자 이름 → 400', longName.status === 400, JSON.stringify(longName.json));
 
+  console.log('[11] 다른 차량 사칭');
+  sendJson(A2, { type: 'vehicle_status', vehicleId: v2, data: { ready: true } });
+  check('남의 vehicleId로 보내면 BAD_STATUS', (await waitFor(A2, (m) => m.type === 'error'))?.error === 'BAD_STATUS');
+  check('사칭 상태는 다른 차로 안 퍼짐', !(await waitFor(B2, (m) => m.type === 'vehicle_status_updated', 400)));
+
+  console.log('[12] 다른 동행 격리');
+  sendJson(B2, { type: 'vehicle_status', data: { ready: true } });
+  await waitFor(A2, (m) => m.type === 'vehicle_status_updated'); // 같은 동행 A2는 받음
+  check('다른 동행(A)은 상태 알림 안 받음', !(await waitFor(A, (m) => m.type === 'vehicle_status_updated', 400)));
+
   A.close();
   A2.close();
   B2.close();

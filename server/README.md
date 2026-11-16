@@ -31,7 +31,7 @@ node index.js      # "서버 시작! 포트 3000"이 뜨면 정상
 ## 테스트
 서버를 켠 상태에서 다른 터미널에서:
 ```bash
-node e2e-test.js                          # 전체 자동 테스트 (28개 항목)
+node e2e-test.js                          # 전체 자동 테스트 (31개 항목)
 BASE=http://<IP>:3000 node e2e-test.js    # 다른 PC의 서버 확인
 node ws-test.js g1 v1                     # 앱 대신 직접 연결해보기 (r / n / w 코드 / {JSON} / leave)
 ```
