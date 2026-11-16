@@ -7,8 +7,11 @@
 ```bash
 cd server
 npm install        # 처음 한 번
-node index.js      # "서버 시작!"이 뜨면 정상
+node index.js      # "서버 시작! 포트 3000"이 뜨면 정상
 ```
+- 포트 바꾸기: `env/.env.example`을 `env/.env`로 복사해 `SERVER_PORT`를 고치거나, `SERVER_PORT=4000 node index.js`. 둘 다 있으면 터미널 값이 우선. 없으면 3000
+- `env/.env` 읽기는 Node 20.12 이상에서만 동작 (`node -v`로 확인). 그 아래 버전은 파일을 무시하고 터미널 값·3000을 씀
+- 포트를 바꿨으면 테스트도 `BASE=http://localhost:<포트> node e2e-test.js`
 - 같은 PC: `http://localhost:3000`
 - 다른 PC·에뮬레이터: `http://<서버 PC의 IP>:3000` (맥은 `ipconfig getifaddr en0`으로 IP 확인)
 - 안 붙으면: 같은 네트워크인지, 서버가 켜져 있는지, 방화벽에서 node 수신이 허용됐는지 확인
