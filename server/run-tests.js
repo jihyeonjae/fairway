@@ -11,6 +11,9 @@ const SUITES = [
   { file: 'hazard-test.js', env: {} },
   { file: 'lifecycle-test.js', env: { DEBUG_STATS: '1' } },
   { file: 'lifecycle-expire-test.js', env: { DEBUG_STATS: '1', GROUP_TTL_MS: '1500', CODE_TTL_MS: '600', SWEEP_INTERVAL_MS: '200' } },
+  // 정리 주기를 10분으로 길게 → 정리 작업이 아니라 요청 시점에 끝내는 코드만 검사된다
+  { file: 'lifecycle-timing-test.js', env: { DEBUG_STATS: '1', GROUP_TTL_MS: '1000', SWEEP_INTERVAL_MS: '600000' }, testEnv: { MODE: 'lazy' } },
+  { file: 'lifecycle-timing-test.js', env: { DEBUG_STATS: '1', TOMBSTONE_TTL_MS: '500', CODE_TTL_MS: '300', SWEEP_INTERVAL_MS: '100' }, testEnv: { MODE: 'tombstone' } },
 ];
 const BASE_PORT = Number(process.env.TEST_BASE_PORT) || 3901;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -34,7 +37,7 @@ function run(cmd, args, env) {
 (async () => {
   const results = [];
   for (let i = 0; i < SUITES.length; i++) {
-    const { file, env } = SUITES[i];
+    const { file, env, testEnv = {} } = SUITES[i];
     const port = String(BASE_PORT + i);
     const base = `http://localhost:${port}`;
     console.log(`\n━━━ ${file} (포트 ${port}${Object.keys(env).length ? ', ' + Object.entries(env).map(([k, v]) => `${k}=${v}`).join(' ') : ''}) ━━━`);
@@ -48,10 +51,10 @@ function run(cmd, args, env) {
       results.push([file, 1]);
       continue;
     }
-    const code = await run(process.execPath, [file], { BASE: base });
+    const code = await run(process.execPath, [file], { BASE: base, ...testEnv });
     server.kill();
     await new Promise((r) => server.on('exit', r));
-    results.push([file, code]);
+    results.push([file + (testEnv.MODE ? ` (${testEnv.MODE})` : ''), code]);
   }
   console.log('\n━━━ 요약 ━━━');
   for (const [file, code] of results) console.log(`${code === 0 ? '✅' : '❌'} ${file}`);
