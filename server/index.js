@@ -236,8 +236,10 @@ function handleVehicleStatus(ws, msg) {
 
   // 기본값 → 이전 값 → 이번에 보낸 칸 순서로 덮어쓴다
   // ready만 보내면 warning은 이전 값 유지, 처음이면 기본값 → 항상 ready·warning 둘 다 있음
+  const prevWarning = (vehicle.status || DEFAULT_STATUS).warning;
   vehicle.status = { ...DEFAULT_STATUS, ...(vehicle.status || {}), ...checked.value };
   broadcastExcept(ws.groupId, ws, statusMessage(ws.groupId, vehicle));
+  onWarningChanged(ws, group, vehicle, prevWarning, vehicle.status.warning, now); // 위험 코드로 바뀌면 위험 생성
 }
 
 // ── 차량 위치 (location) ──
@@ -337,6 +339,171 @@ function handleLocation(ws, msg) {
     vehicle.lastMovingHeading = { heading: v.heading, receivedAt: now };
   }
   broadcastExcept(ws.groupId, ws, locationMessage(ws.groupId, vehicle));
+  onLocationUpdated(ws, group, vehicle, now); // 기다리던 위험 생성 + 다가온 위험 경고
+}
+
+// ── 위험 감지와 뒤차 경고 (hazard) ──
+// 별도 메시지 없이 기존 vehicle_status.warning에서 만든다 (11.17 리더 결정)
+// warning이 위험 코드로 "바뀌는 순간" 보낸 차의 최근 위치·방향으로 위험 지점을 하나 만들고,
+// 같은 동행에서 그 지점에 다가오는 뒤차에게만 hazard_alert를 1번 보낸다
+// 직선거리·방향 기준의 시연용 판정이다. 실제 도로상 앞뒤 관계를 보장하지 않는다
+// 아래 숫자는 전부 가정값. 환경변수로 바꿀 수 있다
+const HAZARD_CODES = new Set((process.env.HAZARD_CODES || 'ESC_BLINK,HAZARD_TELLTALE').split(',').map(s => s.trim()).filter(Boolean));
+const HAZARD_CLEAR_ON_OFF = new Set(['HAZARD_TELLTALE']);     // 경고가 꺼지면 위험도 지운다 (비상등). ESC_BLINK는 노면 위험이라 만료까지 유지
+const HAZARD_TTL_MS = Number(process.env.HAZARD_TTL_MS) || 10 * 60 * 1000;          // 위험 유지 10분
+const HAZARD_ALERT_RADIUS_M = Number(process.env.HAZARD_ALERT_RADIUS_M) || 1500;    // 1.5km 안에 들어오면 경고 (문서 가정값)
+const HAZARD_DEDUP_RADIUS_M = Number(process.env.HAZARD_DEDUP_RADIUS_M) || 100;     // 같은 차·같은 종류가 100m 안에서 또 켜지면 같은 위험으로 본다
+const FRESH_LOCATION_MS = Number(process.env.FRESH_LOCATION_MS) || 3000;            // 위험 판정에 쓰는 위치는 서버가 받은 지 3초 이내만
+const HAZARD_PENDING_MS = Number(process.env.HAZARD_PENDING_MS) || 3000;            // 위치보다 경고가 먼저 오면 3초까지 위치를 기다린다
+const SOURCE_HEADING_MAX_AGE_MS = Number(process.env.SOURCE_HEADING_MAX_AGE_MS) || 5 * 60 * 1000; // 위험 낸 차는 서서 비상등을 켜는 경우가 많아서, 5분 전까지의 이동 방향을 쓴다
+const SAME_DIRECTION_DEG = 45;  // 뒤차 진행 방향과 위험 방향 차이가 45° 이내여야 같은 방향
+const AHEAD_DEG = 60;           // 뒤차 기준 위험 지점이 앞쪽 ±60° 안에 있어야 "다가오는 중"
+
+const toRad = (d) => d * Math.PI / 180;
+// 두 좌표 사이 직선거리(m), 하버사인 공식
+function distanceM(a, b) {
+  const R = 6371000;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+// a에서 b를 바라보는 방위각(0=북, 90=동)
+function bearingDeg(a, b) {
+  const y = Math.sin(toRad(b.lng - a.lng)) * Math.cos(toRad(b.lat));
+  const x = Math.cos(toRad(a.lat)) * Math.sin(toRad(b.lat)) - Math.sin(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.cos(toRad(b.lng - a.lng));
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+// 두 방향의 차이(0~180)
+const angleDiff = (a, b) => Math.abs(((a - b + 540) % 360) - 180);
+
+const freshLocation = (vehicle, now) => vehicle.location && now - vehicle.location.receivedAt <= FRESH_LOCATION_MS ? vehicle.location : null;
+
+// 만료된 위험 정리 (조회할 때마다 같이 한다. 별도 타이머가 필요 없음)
+function pruneHazards(group, now) {
+  if (!group.hazards) group.hazards = new Map();
+  for (const [id, hz] of group.hazards) if (now >= hz.expiresAt) group.hazards.delete(id);
+  return group.hazards;
+}
+
+// 이 차가 이 위험에 대해 경고를 받아야 하는지. 판단에 필요한 값이 없으면 추측하지 않고 false(보류)
+function shouldAlert(hz, vehicle, now) {
+  if (vehicle.vehicleId === hz.sourceVehicleId || hz.notified.has(vehicle.vehicleId)) return false;
+  const loc = freshLocation(vehicle, now);
+  if (!loc) return false;                                     // 위치가 없거나 오래됨
+  const mh = vehicle.lastMovingHeading;
+  if (!mh || now - mh.receivedAt > FRESH_LOCATION_MS) return false; // 지금 움직이는 방향을 모름 (정지 중 포함)
+  const dist = distanceM(loc, hz);
+  if (dist > HAZARD_ALERT_RADIUS_M) return false;
+  if (angleDiff(mh.heading, hz.heading) > SAME_DIRECTION_DEG) return false; // 반대 방향·교차 방향
+  if (angleDiff(mh.heading, bearingDeg(loc, hz)) > AHEAD_DEG) return false; // 위험 지점이 앞에 없음 = 이미 지남
+  return dist;
+}
+
+function alertMessage(groupId, hz, sourceName, dist) {
+  return {
+    type: 'hazard_alert',
+    groupId,
+    hazardId: hz.hazardId,
+    code: hz.code,
+    fromVehicleId: hz.sourceVehicleId,
+    fromVehicleName: sourceName,
+    lat: hz.lat,
+    lng: hz.lng,
+    distanceM: Math.round(dist),
+    createdAt: hz.createdAt,
+    expiresAt: hz.expiresAt,
+  };
+}
+
+// 같은 동행 차량에게 경고 보내기. onlyVehicleId가 있으면 그 차만 검사 (위치가 갱신된 차)
+function deliverAlerts(group, hz, now, onlyVehicleId) {
+  const source = group.vehicles.get(hz.sourceVehicleId);
+  const set = sockets.get(group.groupId);
+  for (const v of group.vehicles.values()) {
+    if (onlyVehicleId && v.vehicleId !== onlyVehicleId) continue;
+    const dist = shouldAlert(hz, v, now);
+    if (dist === false) continue;
+    hz.notified.add(v.vehicleId); // 연결이 없어도 표시 → 같은 위험으로 두 번 안 울림 (재접속 포함)
+    const msg = alertMessage(group.groupId, hz, source ? source.vehicleName : null, dist);
+    if (set) for (const ws of set) if (ws.vehicleId === v.vehicleId) send(ws, msg);
+  }
+}
+
+// 위험 만들기. 위치·방향이 없으면 만들지 않고 이유를 돌려준다
+function createHazard(ws, group, vehicle, code, now) {
+  const loc = freshLocation(vehicle, now);
+  if (!loc) return { pending: 'NO_RECENT_LOCATION' };
+  const mh = vehicle.lastMovingHeading;
+  if (!mh || now - mh.receivedAt > SOURCE_HEADING_MAX_AGE_MS) return { dropped: 'NO_HEADING' };
+
+  const hazards = pruneHazards(group, now);
+  for (const hz of hazards.values()) {
+    if (hz.sourceVehicleId === vehicle.vehicleId && hz.code === code && distanceM(hz, loc) <= HAZARD_DEDUP_RADIUS_M) {
+      return { hazard: hz, duplicate: true };
+    }
+  }
+  const hz = {
+    hazardId: newId('h'),
+    code,
+    sourceVehicleId: vehicle.vehicleId,
+    lat: loc.lat,
+    lng: loc.lng,
+    heading: mh.heading,
+    createdAt: now,
+    expiresAt: now + HAZARD_TTL_MS,
+    notified: new Set(),
+  };
+  hazards.set(hz.hazardId, hz);
+  deliverAlerts(group, hz, now);
+  return { hazard: hz, duplicate: false };
+}
+
+// 보낸 차에게 결과 알려주기 (warning 코드를 잘못 보내 조용히 실패하는 것 방지)
+function replyHazardResult(ws, code, result) {
+  if (result.hazard) {
+    const hz = result.hazard;
+    return send(ws, { type: 'hazard_created', hazardId: hz.hazardId, code, lat: hz.lat, lng: hz.lng, heading: hz.heading, duplicate: result.duplicate, expiresAt: hz.expiresAt });
+  }
+  if (result.pending) return send(ws, { type: 'hazard_pending', code, reason: result.pending, waitMs: HAZARD_PENDING_MS });
+  send(ws, { type: 'hazard_not_created', code, reason: result.dropped });
+}
+
+// vehicle_status 처리 뒤 호출. warning이 바뀐 순간에만 동작
+function onWarningChanged(ws, group, vehicle, prev, next, now) {
+  if (prev === next) return;
+  // 꺼짐: 비상등류는 위험을 지우고 동행에 알린다
+  if (HAZARD_CODES.has(prev) && HAZARD_CLEAR_ON_OFF.has(prev)) {
+    const hazards = pruneHazards(group, now);
+    for (const [id, hz] of hazards) {
+      if (hz.sourceVehicleId === vehicle.vehicleId && hz.code === prev) {
+        hazards.delete(id);
+        broadcastExcept(group.groupId, null, { type: 'hazard_cleared', groupId: group.groupId, hazardId: id, code: prev });
+      }
+    }
+  }
+  if (vehicle.pendingHazard && vehicle.pendingHazard.code !== next) vehicle.pendingHazard = null;
+  if (!HAZARD_CODES.has(next)) return;
+  const result = createHazard(ws, group, vehicle, next, now);
+  if (result.pending) vehicle.pendingHazard = { code: next, until: now + HAZARD_PENDING_MS };
+  replyHazardResult(ws, next, result);
+}
+
+// handleLocation이 위치를 저장한 뒤 호출
+function onLocationUpdated(ws, group, vehicle, now) {
+  // 1) 위치를 기다리던 위험이 있으면 지금 만든다
+  const p = vehicle.pendingHazard;
+  if (p) {
+    vehicle.pendingHazard = null;
+    const stillOn = vehicle.status && vehicle.status.warning === p.code;
+    if (now <= p.until && stillOn) {
+      replyHazardResult(ws, p.code, createHazard(ws, group, vehicle, p.code, now));
+    } else if (stillOn) {
+      send(ws, { type: 'hazard_not_created', code: p.code, reason: 'LOCATION_TIMEOUT' });
+    }
+  }
+  // 2) 이 차가 기존 위험에 다가왔는지 검사
+  for (const hz of pruneHazards(group, now).values()) deliverAlerts(group, hz, now, vehicle.vehicleId);
 }
 
 // 이 연결을 지금 동행의 알림 대상에서 빼기 (방을 바꾸거나, 나가거나, 끊길 때)

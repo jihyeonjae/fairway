@@ -45,6 +45,11 @@
 | 서버→앱 | `vehicle_status_updated` | groupId, vehicleId, vehicleName, data `{ready, warning}` | 다른 차량이 vehicle_status를 보냈을 때 같은 동행의 **보낸 차량 제외** 전체에. `join` 직후에도 다른 차들의 마지막 상태를 1회씩 |
 | 앱→서버 | `location` | data `{lat, lng, heading, speed, accuracy, timestamp}`, vehicleId(생략 가능) | **1초마다. 서 있어도 보냄** |
 | 서버→앱 | `vehicle_location_updated` | groupId, vehicleId, vehicleName, data `{lat, lng, heading, speed, accuracy, measuredAt, receivedAt}` | 같은 동행의 **보낸 차량 제외** 전체에. `join` 직후에도 다른 차들의 최근 60초 안 위치를 1회씩 |
+| 서버→앱 | `hazard_created` | hazardId, code, lat, lng, heading, duplicate, expiresAt | 내가 보낸 warning으로 위험이 만들어졌을 때 **보낸 차에만** |
+| 서버→앱 | `hazard_pending` | code, reason(`NO_RECENT_LOCATION`), waitMs | 최근 위치가 없어 위치를 기다릴 때 보낸 차에만 |
+| 서버→앱 | `hazard_not_created` | code, reason(`NO_HEADING` / `LOCATION_TIMEOUT`) | 위험을 만들지 못했을 때 보낸 차에만 |
+| 서버→앱 | `hazard_alert` | groupId, hazardId, code, fromVehicleId, fromVehicleName, lat, lng, distanceM, createdAt, expiresAt | 위험 지점에 다가오는 뒤차에만, **위험 하나당 차 한 대에 1번** |
+| 서버→앱 | `hazard_cleared` | groupId, hazardId, code | 비상등(`HAZARD_TELLTALE`)이 꺼져 위험이 지워질 때 동행 전체에 |
 
 - 1차의 `ready`/`warning`은 **연습용 값**이다 (예: `ready:true`, `warning:"NONE"`). 차량 SDK에서 읽은 값이 아니다.
 - `vehicle_status` 검사 (실패 시 보낸 연결에만 `error`, 다른 차로는 안 퍼짐)
@@ -88,6 +93,28 @@
 - 숫자(1초, 5회, 10초, 5초, 60초)는 전부 가정값. 환경변수 `LOCATION_MAX_PER_SEC`, `LOCATION_MAX_AGE_MS`, `LOCATION_MAX_FUTURE_MS`, `LOCATION_REPLAY_MAX_MS`로 바꿀 수 있다
 - 자동 테스트: `server/location-test.js`
 
+### 위험 경고 (11.17 추가, 별도 메시지 없음)
+앱이 보낼 것은 **기존 `vehicle_status`의 `warning`뿐**이다. 서버가 warning 변화에서 위험을 만든다 (리더 결정).
+
+- **위험 코드**: `ESC_BLINK`(ESC 텔테일 BLINK = 미끄러짐), `HAZARD_TELLTALE`(좌우 방향지시등 텔테일 동시 BLINK = 비상등으로 간주). 그 외 코드(`TIRE_LOW` 등)는 상태로만 전달하고 위험을 만들지 않는다. 환경변수 `HAZARD_CODES`로 바꿀 수 있다
+  - 11.16 에뮬레이터 실측: Virtual Console의 실제 비상등 스위치는 앱에 아무 이벤트도 안 준다. 시연은 텔테일 주입으로 하고, 실제 비상등 연동은 가정이다
+- **언제 만드나**: warning이 위험 코드로 **바뀌는 순간** 1번. 계속 같은 값을 보내면 아무 일도 없다
+- **위험 지점**: 그 순간 서버가 가진 보낸 차의 위치(3초 이내 수신) + 이동 중이던 마지막 방향(5분 이내)
+  - 위치가 없으면 → `hazard_pending`, 3초 안에 위치가 오면 그때 생성(`hazard_created`), 안 오면 `hazard_not_created`(`LOCATION_TIMEOUT`)
+  - 움직인 적이 없어 방향을 모르면 → `hazard_not_created`(`NO_HEADING`). 앞뒤 판정이 불가능해서 추측하지 않는다
+- **중복**: 같은 차·같은 코드·100m 이내에 살아 있는 위험이 있으면 새로 만들지 않고 `hazard_created`에 `duplicate:true`와 기존 hazardId를 준다
+- **유지 시간**: 10분. `HAZARD_TELLTALE`은 warning이 꺼지면 바로 지우고 `hazard_cleared`를 보낸다. `ESC_BLINK`는 노면 위험이라 꺼져도 10분 유지
+- **누구에게 경고하나 (`hazard_alert`)**: 같은 동행에서 아래를 모두 만족하는 차
+  1. 위치가 3초 이내에 들어왔고, 3초 이내에 움직이는 방향을 받았음 (정지·위치 없음이면 보류)
+  2. 위험 지점까지 직선거리 1.5km 이내
+  3. 진행 방향이 위험 방향과 45° 이내 (반대 방향 제외)
+  4. 위험 지점이 진행 방향 앞쪽 ±60° 안 (이미 지난 차 제외)
+- 위험이 생길 때 한 번, 그리고 **각 차의 위치가 들어올 때마다** 다시 검사한다. 멀리 있던 차도 1.5km 안에 들어오면 그때 받는다
+- 한 차는 같은 위험으로 **한 번만** 받는다 (재접속해도 다시 안 옴). 경고를 받을 때 연결이 끊겨 있었으면 그 경고는 놓친다
+- **한계 (PT·기획서에 그대로 쓸 것)**: 직선거리와 방향만 쓰는 시연용 판정이다. 실제 도로의 앞뒤 관계(곡선 도로, 고가·지하차도, 나란한 도로)를 구분하지 못한다. 실제 운전자 안전 경고 수준이라고 표현하지 않는다
+- 숫자(3초, 5분, 1.5km, 45°, 60°, 100m, 10분)는 전부 가정값. 환경변수: `HAZARD_TTL_MS`, `HAZARD_ALERT_RADIUS_M`, `HAZARD_DEDUP_RADIUS_M`, `FRESH_LOCATION_MS`, `HAZARD_PENDING_MS`, `SOURCE_HEADING_MAX_AGE_MS`
+- 자동 테스트: `server/hazard-test.js`
+
 - 자동 테스트: `server/e2e-test.js` (전체), `server/expire-test.js` (코드 만료, 서버를 `CODE_TTL_MS=2000`으로 켜고 실행)
 - 수동 테스트: `server/ws-test.js` (`node ws-test.js <groupId> <vehicleId>`, ID는 REST 응답값). 연결 후 `r`/`n`/`w 코드`/`{JSON}`/`leave` 입력. 다른 PC면 `WS_URL=ws://<IP>:3000 node ws-test.js <groupId> <vehicleId>`
 
@@ -98,18 +125,6 @@
 
 ---
 
-## 다음 단계 (기존 설계 v3, 미확정)
-아래는 이전 규격에 있던 위험 공유 기능이다. 1차 범위 밖이며, 붙일 때 키 이름은 위 규격(`type`, groupId/vehicleId)에 맞춰 다시 정한다.
-
-| 방향 | 이름 | 필드 | 보내는 때 |
-| --- | --- | --- | --- |
-| 앱→서버 | `hazard` | kind(`"HAZARD_LIGHT"`/`"SLIP"`), lat, lng, heading, locAgeMs, durationMs | 판정 규칙 통과 시 1회 |
-| 앱→서버 | `capability` | hazardLight: bool, esc: bool | 연결 직후 1회 |
-| 앱→서버 | `alert_ack` | hazardId | 음성을 읽은 뒤 |
-| 서버→앱 | `hazard_alert` | hazardId, kind, distanceM, fromVehicle, count | 매칭 조건 만족 시 수신차에 1회 |
-| 서버→앱 | `demo_location` | lat, lng, heading | 시연 모드 스크립트가 차량을 움직일 때. 0.5초 간격(가정) |
-| 서버→앱 | `session_end` | reason | 동행 종료 |
-| 서버→앱 | `error` | code, message | 잘못된 메시지 |
-
-- `Hazard { id, kind, lat, lng, heading, firstTs, lastTs, fromVehicle, count }`
-- 수신차가 alert_ack를 안 보내도 보낸 시점에 alerted에 넣는다 (재연결 시 중복 경고 방지).
+## 다음 단계 (기존 설계 v3에서 남은 것, 미확정)
+위치(`location`)와 위험(`hazard_*`)은 11.17에 위 규격으로 확정됐다. v3의 별도 `hazard` 메시지 안은 쓰지 않는다 (warning 재사용으로 결정).
+아직 안 만든 것: `capability`(차량이 어떤 신호를 지원하는지), `alert_ack`(경고 음성 재생 확인), 같은 위험을 여러 차가 보고한 횟수(`count`).
