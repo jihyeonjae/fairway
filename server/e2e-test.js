@@ -1,4 +1,4 @@
-// 처음부터 끝까지 한 번에 확인하는 테스트 (11.14 계획서 체크리스트 + 리더 요구 2건)
+// 처음부터 끝까지 한 번에 확인하는 테스트 (11.14 계획서 체크리스트 + 리더 요구 2건 + 11.16 재연결·중복 참가)
 // 사용법: 서버를 켠 상태에서 다른 창에서  node e2e-test.js
 // 다른 PC의 서버를 확인하려면:  BASE=http://<IP>:3000 node e2e-test.js
 const WebSocket = require('ws');
@@ -123,8 +123,49 @@ async function main() {
   await api('POST', '/api/groups/join', { inviteCode: c2.json.inviteCode, vehicleName: 'B새차' });
   check('새 방 소식은 옴', !!(await waitFor(A, (m) => m.type === 'group_state' && m.groupId === c2.json.groupId)));
 
+  console.log('[8] 끊고 다시 연결');
+  const A2 = await connect();
+  sendJson(A2, { type: 'join', groupId: g, vehicleId: v1 });
+  check('재연결: 명단 다시 받음', !!(await waitFor(A2, (m) => m.type === 'group_state' && m.groupId === g)));
+  const last = await waitFor(A2, (m) => m.type === 'vehicle_status_updated' && m.vehicleId === v2);
+  check('재연결: 2호차 마지막 상태(ready=true) 받음', last?.data?.ready === true, JSON.stringify(last));
+
+  console.log('[9] 같은 차량 중복 연결');
+  B.closeCode = null;
+  B.on('close', (code) => { B.closeCode = code; });
+  const B2 = await connect();
+  sendJson(B2, { type: 'join', groupId: g, vehicleId: v2 });
+  await waitFor(B2, (m) => m.type === 'group_state');
+  check('예전 B 연결은 REPLACED 받음', !!(await waitFor(B, (m) => m.type === 'error' && m.error === 'REPLACED')));
+  await sleep(200);
+  check('예전 B 연결은 close 코드 4000으로 끊김', B.closeCode === 4000, String(B.closeCode));
+  sendJson(B2, { type: 'vehicle_status', data: { ready: false } });
+  const st2 = await waitFor(A2, (m) => m.type === 'vehicle_status_updated' && m.vehicleId === v2);
+  check('새 B2 상태가 A2로 전달', st2?.data?.ready === false, JSON.stringify(st2));
+
+  console.log('[10] 이름 검사');
+  const dup = await api('POST', '/api/groups/join', { inviteCode: code, vehicleName: '2호차' });
+  check('같은 이름 → DUPLICATE_NAME (409)', dup.status === 409 && dup.json?.error === 'DUPLICATE_NAME', JSON.stringify(dup.json));
+  const dupSpace = await api('POST', '/api/groups/join', { inviteCode: code, vehicleName: ' 2호차 ' });
+  check('앞뒤 공백 붙여도 같은 이름으로 거절', dupSpace.json?.error === 'DUPLICATE_NAME', JSON.stringify(dupSpace.json));
+  const numName = await api('POST', '/api/groups', { vehicleName: 123 });
+  check('문자열 아닌 이름 → 400', numName.status === 400 && numName.json?.error === 'MISSING_VEHICLE_NAME', JSON.stringify(numName.json));
+  const longName = await api('POST', '/api/groups', { vehicleName: 'x'.repeat(21) });
+  check('21자 이름 → 400', longName.status === 400, JSON.stringify(longName.json));
+
+  console.log('[11] 다른 차량 사칭');
+  sendJson(A2, { type: 'vehicle_status', vehicleId: v2, data: { ready: true } });
+  check('남의 vehicleId로 보내면 BAD_STATUS', (await waitFor(A2, (m) => m.type === 'error'))?.error === 'BAD_STATUS');
+  check('사칭 상태는 다른 차로 안 퍼짐', !(await waitFor(B2, (m) => m.type === 'vehicle_status_updated', 400)));
+
+  console.log('[12] 다른 동행 격리');
+  sendJson(B2, { type: 'vehicle_status', data: { ready: true } });
+  await waitFor(A2, (m) => m.type === 'vehicle_status_updated'); // 같은 동행 A2는 받음
+  check('다른 동행(A)은 상태 알림 안 받음', !(await waitFor(A, (m) => m.type === 'vehicle_status_updated', 400)));
+
   A.close();
-  B.close();
+  A2.close();
+  B2.close();
 }
 
 main()

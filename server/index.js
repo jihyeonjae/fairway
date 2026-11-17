@@ -1,3 +1,15 @@
+const path = require('path');
+const fs = require('fs');
+
+// ── 설정 읽기 ──
+// env/.env 가 있으면 읽는다 (없으면 기본값). 형식은 env/.env.example 참고
+// 이미 터미널에서 준 환경변수(SERVER_PORT=4000 node index.js)가 파일보다 우선
+const ENV_FILE = path.join(__dirname, '..', 'env', '.env');
+if (fs.existsSync(ENV_FILE) && typeof process.loadEnvFile === 'function') {
+  process.loadEnvFile(ENV_FILE); // Node 20.12+ 내장 기능
+}
+const PORT = Number(process.env.SERVER_PORT) || 3000;
+
 const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
@@ -8,8 +20,12 @@ app.use(express.json());
 // ── 메모리 저장소 (서버 끄면 사라짐) ──
 const groups = new Map();      // groupId → 동행 정보
 const codeToGroup = new Map(); // inviteCode → groupId (코드로 동행 찾기용)
-let groupSeq = 0;              // g1, g2, ... 만들 때 쓰는 번호
-let vehicleSeq = 0;            // v1, v2, ... 동행이 달라도 서버 전체에서 겹치지 않음
+// ID는 무작위로 만든다. 순번(g1, v2)이면 서버를 재시작했을 때 번호가 1부터 다시 시작해서,
+// 앱이 저장해 둔 예전 ID가 새로 생긴 다른 차량 ID와 겹쳐 남의 차로 접속될 수 있다
+const crypto = require('crypto');
+function newId(prefix) {
+  return prefix + crypto.randomBytes(6).toString('hex'); // 예: g3f9a1c0b7e2d
+}
 
 // 6자리 코드 만들기. 이미 쓰는 코드면 다시 뽑는다
 function newInviteCode() {
@@ -20,17 +36,26 @@ function newInviteCode() {
   return code;
 }
 
+// 이름 정리: 문자열만, 앞뒤 공백 제거, 1~20자 (20자는 가정). 아니면 null
+// "2호차"와 "2호차 "를 같은 이름으로 보게 해서 중복 검사가 공백으로 뚫리지 않게 한다
+const NAME_MAX = 20;
+function cleanName(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  return s.length >= 1 && s.length <= NAME_MAX ? s : null;
+}
+
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ── 동행 만들기 ──
 app.post('/api/groups', (req, res) => {
-  const vehicleName = req.body?.vehicleName; // ?. = body가 없어도 에러 없이 undefined
+  const vehicleName = cleanName(req.body?.vehicleName); // ?. = body가 없어도 에러 없이 undefined
   if (!vehicleName) {
-    return res.status(400).json({ error: 'MISSING_VEHICLE_NAME', message: 'vehicleName이 필요합니다' });
+    return res.status(400).json({ error: 'MISSING_VEHICLE_NAME', message: 'vehicleName은 1~20자 문자열이어야 합니다' });
   }
 
-  const groupId = 'g' + (++groupSeq);
-  const vehicleId = 'v' + (++vehicleSeq);
+  const groupId = newId('g');
+  const vehicleId = newId('v');
   const inviteCode = newInviteCode();
 
   groups.set(groupId, {
@@ -46,7 +71,8 @@ app.post('/api/groups', (req, res) => {
 });
 
 // ── 참가 규칙 (계획서 가정값) ──
-const CODE_TTL_MS = 30 * 60 * 1000; // 코드 유효시간 30분 (가정)
+// 코드 유효시간 30분 (가정). 테스트 땐  CODE_TTL_MS=2000 node index.js  처럼 짧게
+const CODE_TTL_MS = Number(process.env.CODE_TTL_MS) || 30 * 60 * 1000;
 const MAX_VEHICLES = 5;             // 동행 최대 5대 (가정)
 
 // 동행 안 차량들의 이름만 뽑아서 배열로: ["1호차", "2호차"]
@@ -57,9 +83,9 @@ function vehicleNames(group) {
 // ── 동행 참가하기 ──
 app.post('/api/groups/join', (req, res) => {
   const inviteCode = req.body?.inviteCode;
-  const vehicleName = req.body?.vehicleName;
+  const vehicleName = cleanName(req.body?.vehicleName);
   if (!vehicleName) {
-    return res.status(400).json({ error: 'MISSING_VEHICLE_NAME', message: 'vehicleName이 필요합니다' });
+    return res.status(400).json({ error: 'MISSING_VEHICLE_NAME', message: 'vehicleName은 1~20자 문자열이어야 합니다' });
   }
 
   // 코드로 동행 찾기
@@ -74,9 +100,13 @@ app.post('/api/groups/join', (req, res) => {
   if (group.vehicles.size >= MAX_VEHICLES) {
     return res.status(409).json({ error: 'GROUP_FULL', message: `동행은 최대 ${MAX_VEHICLES}대까지입니다` });
   }
+  // 같은 이름이 둘이면 앱 명단에서 구분이 안 된다. 재시작한 앱은 REST 재참가 말고 저장해둔 ID로 WS join만 다시 보낸다
+  if (vehicleNames(group).includes(vehicleName)) {
+    return res.status(409).json({ error: 'DUPLICATE_NAME', message: '이미 같은 이름의 차량이 있습니다' });
+  }
 
   // 통과하면 참가 목록에 추가
-  const vehicleId = 'v' + (++vehicleSeq);
+  const vehicleId = newId('v');
   group.vehicles.set(vehicleId, { vehicleId, vehicleName, status: null });
 
   res.json({ groupId, vehicleId, vehicles: vehicleNames(group) });
@@ -104,8 +134,16 @@ app.use((err, req, res, next) => {
 });
 
 // ── 실시간 연결 (WebSocket) ──
-// REST와 같은 서버·포트(3000)를 같이 쓴다
-const server = app.listen(3000, '0.0.0.0', () => console.log('서버 시작!'));
+// REST와 같은 서버·포트(SERVER_PORT, 기본 3000)를 같이 쓴다
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`서버 시작! 포트 ${PORT}`));
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`포트 ${PORT}을 이미 다른 프로그램이 쓰고 있습니다. 켜져 있는 서버를 끄거나 SERVER_PORT를 바꾸세요`);
+  } else {
+    console.error('[서버 시작 에러]', e.message);
+  }
+  process.exit(1);
+});
 // maxPayload: 메시지 1개 최대 16KB. 기본값(100MB)이면 큰 데이터 한 방에 메모리가 터질 수 있음
 const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 const sockets = new Map(); // groupId → Set<ws> (그 동행에 연결된 앱들)
@@ -229,6 +267,18 @@ function handleMessage(ws, raw) {
     const group = groups.get(msg.groupId);
     if (!group || !group.vehicles.has(msg.vehicleId)) {
       return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다. REST로 먼저 참가하세요');
+    }
+    // 같은 차량의 예전 연결이 남아 있으면 정리 (앱 재시작·재접속·중복 접속)
+    // close 코드 4000을 받은 앱은 자동 재연결하면 안 된다 (두 연결이 서로 끊는 무한 반복 방지)
+    const oldSet = sockets.get(msg.groupId);
+    if (oldSet) {
+      for (const other of oldSet) {
+        if (other !== ws && other.vehicleId === msg.vehicleId) {
+          sendError(other, 'REPLACED', '같은 차량이 다른 곳에서 연결되어 이 연결은 끊습니다');
+          detach(other);
+          other.close(4000, 'replaced');
+        }
+      }
     }
     detach(ws); // 이미 다른 동행에 등록돼 있으면 먼저 뺀다 → 이전 동행 소식이 안 옴
     ws.groupId = msg.groupId;
