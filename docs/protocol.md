@@ -29,6 +29,8 @@
 - **앱은 참가 성공 시 받은 `groupId`·`vehicleId`를 로컬(SharedPreferences 등)에 저장한다.** 앱을 재시작하면 REST로 다시 참가하지 말고 저장한 값으로 WS `join`만 다시 보낸다 (같은 이름으로 REST 재참가하면 `DUPLICATE_NAME`)
   - 400 `BAD_JSON`: 요청 본문이 JSON이 아닐 때 / 500 `SERVER_ERROR`: 서버 내부 오류 (제안)
   - 404 `GROUP_NOT_FOUND`: GET /api/groups/:groupId 에서 없는 groupId (제안)
+  - 410 `GROUP_ENDED`: GET /api/groups/:groupId 에서 종료된 동행 (종료 후 24시간까지 구분, 그 뒤엔 404)
+  - 종료된 동행의 참가 코드는 404 `INVALID_CODE`. 30분 지나 정리된 코드는 24시간까지 410 `CODE_EXPIRED`
 
 ## WebSocket
 접속 주소 (제안): `ws://<서버 IP>:3000` — REST와 같은 서버·포트
@@ -38,9 +40,13 @@
 | --- | --- | --- | --- |
 | 앱→서버 | `join` | groupId, vehicleId | 연결 직후. 실시간 알림 등록용이며 동행 참가 자체는 REST join이 담당 |
 | 앱→서버 | `leave` | - | 방을 나가거나 바꿀 때. 알림만 끊고 동행 명단에서는 빼지 않음 |
+| 앱→서버 | `leave_group` | - | 참가자가 동행에서 **완전히 나갈 때**. 명단·위치·위험 기록에서 빠짐. 호스트는 불가 |
+| 앱→서버 | `end_group` | - | **호스트만**. 동행 종료 |
+| 서버→앱 | `left_group` | groupId | leave_group 성공 시 나간 차에만 |
+| 서버→앱 | `group_ended` | groupId, reason(`HOST_ENDED` / `EXPIRED`) | 동행이 끝날 때 연결된 전체에. 직후 서버가 **close 코드 4001**로 연결을 끊음 |
 | 서버→앱 | `group_state` | groupId, vehicles | 참가 차량 목록이 바뀔 때 해당 동행 연결 전체에 |
 | 서버→앱 | `group_state` | groupId, vehicles | `join` 직후 그 연결에 1회 (현재 명단, 제안) |
-| 서버→앱 | `error` | error, message | 잘못된 메시지를 보낸 연결에만. `BAD_JSON` / `BAD_MESSAGE`(객체가 아님) / `NOT_A_MEMBER`(REST 참가 안 한 vehicleId) / `REPLACED`(같은 차량이 새로 연결돼 이 연결이 끊김) / `NOT_JOINED` / `BAD_STATUS` / `BAD_LOCATION` / `LOCATION_TOO_OLD` / `LOCATION_FROM_FUTURE` / `RATE_LIMITED` / `UNKNOWN_TYPE` / `SERVER_ERROR` (제안). 앱은 message를 토스트로 표시 |
+| 서버→앱 | `error` | error, message | 잘못된 메시지를 보낸 연결에만. `BAD_JSON` / `BAD_MESSAGE`(객체가 아님) / `NOT_A_MEMBER`(REST 참가 안 한 vehicleId) / `REPLACED`(같은 차량이 새로 연결돼 이 연결이 끊김) / `NOT_JOINED` / `BAD_STATUS` / `BAD_LOCATION` / `LOCATION_TOO_OLD` / `LOCATION_FROM_FUTURE` / `RATE_LIMITED` / `NOT_HOST` / `HOST_CANNOT_LEAVE` / `GROUP_ENDED` / `UNKNOWN_TYPE` / `SERVER_ERROR` (제안). 앱은 message를 토스트로 표시 |
 | 앱→서버 | `vehicle_status` | data `{ready?, warning?}`, vehicleId(생략 가능) | 상태 변경 시. 보낸 칸만 갱신 |
 | 서버→앱 | `vehicle_status_updated` | groupId, vehicleId, vehicleName, data `{ready, warning}` | 다른 차량이 vehicle_status를 보냈을 때 같은 동행의 **보낸 차량 제외** 전체에. `join` 직후에도 다른 차들의 마지막 상태를 1회씩 |
 | 앱→서버 | `location` | data `{lat, lng, heading, speed, accuracy, timestamp}`, vehicleId(생략 가능) | **1초마다. 서 있어도 보냄** |
@@ -49,7 +55,7 @@
 | 서버→앱 | `hazard_pending` | code, reason(`NO_RECENT_LOCATION`), waitMs | 최근 위치가 없어 위치를 기다릴 때 보낸 차에만 |
 | 서버→앱 | `hazard_not_created` | code, reason(`NO_HEADING` / `LOCATION_TIMEOUT`) | 위험을 만들지 못했을 때 보낸 차에만 |
 | 서버→앱 | `hazard_alert` | groupId, hazardId, code, fromVehicleId, fromVehicleName, lat, lng, distanceM, createdAt, expiresAt | 위험 지점에 다가오는 뒤차에만, **위험 하나당 차 한 대에 1번** |
-| 서버→앱 | `hazard_cleared` | groupId, hazardId, code | 비상등(`HAZARD_TELLTALE`)이 꺼져 위험이 지워질 때 동행 전체에 |
+| 서버→앱 | `hazard_cleared` | groupId, hazardId, code | 비상등(`HAZARD_TELLTALE`)이 꺼지거나 위험을 낸 차가 동행에서 나가 위험이 지워질 때 동행 전체에 |
 
 - 1차의 `ready`/`warning`은 **연습용 값**이다 (예: `ready:true`, `warning:"NONE"`). 차량 SDK에서 읽은 값이 아니다.
 - `vehicle_status` 검사 (실패 시 보낸 연결에만 `error`, 다른 차로는 안 퍼짐)

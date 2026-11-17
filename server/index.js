@@ -33,6 +33,7 @@ function newInviteCode() {
   do {
     code = String(Math.floor(Math.random() * 1000000)).padStart(6, '0');
   } while (codeToGroup.has(code));
+  expiredCodes.delete(code); // 예전에 만료된 같은 번호의 안내 기록이 남아 있으면 지운다
   return code;
 }
 
@@ -46,6 +47,19 @@ function cleanName(v) {
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// 테스트 전용: 메모리에 남은 데이터 개수 (삭제가 실제로 됐는지 확인용). DEBUG_STATS=1일 때만 켜진다
+if (process.env.DEBUG_STATS === '1') {
+  app.get('/debug/stats', (req, res) => {
+    let vehicles = 0; let locations = 0; let hazards = 0;
+    for (const g of groups.values()) {
+      vehicles += g.vehicles.size;
+      for (const v of g.vehicles.values()) if (v.location) locations++;
+      hazards += g.hazards ? g.hazards.size : 0;
+    }
+    res.json({ groups: groups.size, codes: codeToGroup.size, vehicles, locations, hazards, socketGroups: sockets.size, endedGroups: endedGroups.size, expiredCodes: expiredCodes.size });
+  });
+}
 
 // ── 동행 만들기 ──
 app.post('/api/groups', (req, res) => {
@@ -90,7 +104,11 @@ app.post('/api/groups/join', (req, res) => {
 
   // 코드로 동행 찾기
   const groupId = codeToGroup.get(String(inviteCode));
-  const group = groups.get(groupId);
+  // 정리 작업이 코드 찾기 목록에서 지운 만료 코드도 "없는 코드"가 아니라 "만료"로 알려준다
+  if (!groupId && expiredCodes.has(String(inviteCode))) {
+    return res.status(410).json({ error: 'CODE_EXPIRED', message: '참가 코드 유효시간이 지났습니다' });
+  }
+  const group = getLiveGroup(groupId);
   if (!group) {
     return res.status(404).json({ error: 'INVALID_CODE', message: '없는 참가 코드입니다' });
   }
@@ -115,7 +133,10 @@ app.post('/api/groups/join', (req, res) => {
 
 // ── 참가 차량 목록 보기 ──
 app.get('/api/groups/:groupId', (req, res) => {
-  const group = groups.get(req.params.groupId);
+  const group = getLiveGroup(req.params.groupId);
+  if (!group && endedGroups.has(req.params.groupId)) {
+    return res.status(410).json({ error: 'GROUP_ENDED', message: '종료된 동행입니다' });
+  }
   if (!group) {
     return res.status(404).json({ error: 'GROUP_NOT_FOUND', message: '없는 동행입니다' });
   }
@@ -230,7 +251,7 @@ function handleVehicleStatus(ws, msg) {
   const checked = validateStatus(msg.data);
   if (checked.error) return sendError(ws, 'BAD_STATUS', checked.error);
 
-  const group = groups.get(ws.groupId);
+  const group = getLiveGroup(ws.groupId);
   const vehicle = group && group.vehicles.get(ws.vehicleId);
   if (!vehicle) return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다');
 
@@ -324,7 +345,7 @@ function handleLocation(ws, msg) {
   const checked = validateLocation(msg.data, now);
   if (checked.error) return sendError(ws, checked.error, checked.message);
 
-  const group = groups.get(ws.groupId);
+  const group = getLiveGroup(ws.groupId);
   const vehicle = group && group.vehicles.get(ws.vehicleId);
   if (!vehicle) return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다');
 
@@ -517,6 +538,108 @@ function detach(ws) {
   ws.vehicleId = null;
 }
 
+// ── 동행 종료와 데이터 삭제 (11.17) ──
+// 동행이 끝나면 그 동행의 차량 명단·위치·위험 기록·참가 코드·실시간 연결을 전부 지운다
+// 끝난 동행은 groupId와 끝난 시각만 잠깐 남겨서(개인 데이터 없음) 늦게 온 요청에 "종료됨"이라고 정확히 알려준다
+// 아래 숫자는 전부 가정값. 테스트 땐 GROUP_TTL_MS=1500 SWEEP_INTERVAL_MS=200 처럼 짧게
+const GROUP_TTL_MS = Number(process.env.GROUP_TTL_MS) || 12 * 60 * 60 * 1000;         // 동행은 만든 지 12시간이 지나면 자동 종료
+const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS) || 60 * 1000;         // 1분마다 정리
+const TOMBSTONE_TTL_MS = Number(process.env.TOMBSTONE_TTL_MS) || 24 * 60 * 60 * 1000; // "종료됨"·"만료된 코드" 안내는 24시간 동안만
+const CLOSE_GROUP_ENDED = 4001; // 이 close 코드를 받은 앱은 자동 재연결하지 않는다 (4000 REPLACED와 같은 규칙)
+
+const endedGroups = new Map();  // groupId → 끝난 시각 (개인 데이터 없음)
+const expiredCodes = new Map(); // inviteCode → 만료 처리한 시각 (codeToGroup에서는 지움)
+
+// 동행 끝내기. 두 번 불려도 안전하다 (이미 없으면 false)
+function endGroup(groupId, reason) {
+  const group = groups.get(groupId);
+  if (!group) return false;
+  // 1) 지금 연결된 앱들에게 알리고 연결을 끊는다
+  const set = sockets.get(groupId);
+  if (set) {
+    for (const ws of [...set]) {
+      send(ws, { type: 'group_ended', groupId, reason });
+      ws.groupId = null; // 이후 이 연결로 늦게 오는 위치·상태는 NOT_JOINED로 거절되고 저장되지 않는다
+      ws.vehicleId = null;
+      ws.close(CLOSE_GROUP_ENDED, 'group_ended');
+    }
+    sockets.delete(groupId);
+  }
+  // 2) 참가 코드 무효화 (코드로 동행 찾기 목록에서 제거)
+  if (codeToGroup.get(group.inviteCode) === groupId) codeToGroup.delete(group.inviteCode);
+  expiredCodes.delete(group.inviteCode);
+  // 3) 동행 삭제. 차량 명단, 각 차의 위치·이동 방향·대기 중 위험, 위험 기록과 "이미 알린 차" 기록이 전부 이 객체 안에 있다
+  groups.delete(groupId);
+  endedGroups.set(groupId, Date.now());
+  console.log(`[동행 종료] ${groupId} (${reason})`);
+  return true;
+}
+
+// 동행을 꺼낼 때 시간이 지났으면 그 자리에서 끝낸다 (정리 주기를 기다리지 않음)
+function getLiveGroup(groupId) {
+  const group = groups.get(groupId);
+  if (group && Date.now() - group.createdAt >= GROUP_TTL_MS) {
+    endGroup(groupId, 'EXPIRED');
+    return null;
+  }
+  return group || null;
+}
+
+// 주기 정리: 12시간 지난 동행 종료, 30분 지난 참가 코드 제거, 만료 위험 제거, 오래된 안내 기록 제거
+// 한 번에 끝까지 도는 동기 함수라 겹쳐 실행되지 않고, 이미 지운 것을 다시 지워도 문제없다
+function sweep() {
+  const now = Date.now();
+  for (const [groupId, group] of groups) {
+    if (now - group.createdAt >= GROUP_TTL_MS) { endGroup(groupId, 'EXPIRED'); continue; }
+    if (now - group.createdAt > CODE_TTL_MS && codeToGroup.get(group.inviteCode) === groupId) {
+      codeToGroup.delete(group.inviteCode);
+      expiredCodes.set(group.inviteCode, now);
+    }
+    pruneHazards(group, now);
+  }
+  for (const [id, at] of endedGroups) if (now - at > TOMBSTONE_TTL_MS) endedGroups.delete(id);
+  for (const [code, at] of expiredCodes) if (now - at > TOMBSTONE_TTL_MS) expiredCodes.delete(code);
+}
+setInterval(sweep, SWEEP_INTERVAL_MS).unref(); // unref: 이 타이머 때문에 서버 종료가 막히지 않게
+
+// 호스트가 동행 끝내기 (WS: {"type":"end_group"})
+function handleEndGroup(ws) {
+  if (!ws.groupId) return sendError(ws, 'NOT_JOINED', '먼저 join으로 동행에 연결하세요');
+  const group = getLiveGroup(ws.groupId);
+  if (!group) return sendError(ws, 'GROUP_ENDED', '이미 종료된 동행입니다');
+  if (group.hostVehicleId !== ws.vehicleId) return sendError(ws, 'NOT_HOST', '동행은 만든 차량(호스트)만 종료할 수 있습니다');
+  endGroup(group.groupId, 'HOST_ENDED');
+}
+
+// 참가자가 동행에서 나가기 (WS: {"type":"leave_group"}). 기존 leave(알림만 끊기)와 달리 명단에서 빠진다
+// 나간 차의 위치·위험 기록도 지운다. 자리가 비므로 GROUP_FULL이 풀리고, 같은 이름으로 다시 참가할 수 있다
+function handleLeaveGroup(ws) {
+  if (!ws.groupId) return sendError(ws, 'NOT_JOINED', '먼저 join으로 동행에 연결하세요');
+  const group = getLiveGroup(ws.groupId);
+  if (!group) return sendError(ws, 'GROUP_ENDED', '이미 종료된 동행입니다');
+  const vehicleId = ws.vehicleId;
+  if (group.hostVehicleId === vehicleId) {
+    return sendError(ws, 'HOST_CANNOT_LEAVE', '호스트는 나갈 수 없습니다. 동행 종료(end_group)를 쓰세요');
+  }
+  group.vehicles.delete(vehicleId); // 이름·상태·위치·이동 방향·대기 중 위험이 함께 지워진다
+  for (const [id, hz] of pruneHazards(group, Date.now())) {
+    if (hz.sourceVehicleId === vehicleId) {
+      group.hazards.delete(id);
+      broadcastExcept(group.groupId, null, { type: 'hazard_cleared', groupId: group.groupId, hazardId: id, code: hz.code });
+    } else {
+      hz.notified.delete(vehicleId);
+    }
+  }
+  // 같은 차량의 연결을 동행에서 뺀다 (보통 1개)
+  const set = sockets.get(group.groupId);
+  if (set) {
+    for (const other of [...set]) {
+      if (other.vehicleId === vehicleId) { send(other, { type: 'left_group', groupId: group.groupId }); detach(other); }
+    }
+  }
+  broadcastGroupState(group.groupId);
+}
+
 function handleMessage(ws, raw) {
   let msg;
   try {
@@ -530,7 +653,11 @@ function handleMessage(ws, raw) {
   }
 
   if (msg.type === 'join') {
-    const group = groups.get(msg.groupId);
+    const group = getLiveGroup(msg.groupId);
+    // 앱이 저장해 둔 ID로 다시 들어왔는데 동행이 끝났으면 GROUP_ENDED → 앱은 저장값을 지우고 첫 화면으로
+    if (!group && endedGroups.has(msg.groupId)) {
+      return sendError(ws, 'GROUP_ENDED', '종료된 동행입니다');
+    }
     if (!group || !group.vehicles.has(msg.vehicleId)) {
       return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다. REST로 먼저 참가하세요');
     }
@@ -573,6 +700,14 @@ function handleMessage(ws, raw) {
 
   if (msg.type === 'location') {
     return handleLocation(ws, msg);
+  }
+
+  if (msg.type === 'end_group') {
+    return handleEndGroup(ws);
+  }
+
+  if (msg.type === 'leave_group') {
+    return handleLeaveGroup(ws);
   }
 
   if (msg.type === 'leave') {
