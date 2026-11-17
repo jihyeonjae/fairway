@@ -240,6 +240,105 @@ function handleVehicleStatus(ws, msg) {
   broadcastExcept(ws.groupId, ws, statusMessage(ws.groupId, vehicle));
 }
 
+// ── 차량 위치 (location) ──
+// 앱은 1초마다 위치를 보낸다(서 있어도 보냄). 서버는 차마다 마지막 위치만 기억하고 같은 동행에만 전달한다
+// 아래 숫자는 전부 가정값. 환경변수로 바꿀 수 있다
+const LOCATION_MAX_PER_SEC = Number(process.env.LOCATION_MAX_PER_SEC) || 5;          // 1초 전송이면 5회는 넉넉함. 넘치면 버린다
+const LOCATION_MAX_AGE_MS = Number(process.env.LOCATION_MAX_AGE_MS) || 10 * 1000;     // 측정 시각이 10초보다 오래되면 거절 (끊긴 동안 쌓인 옛 위치 방지)
+const LOCATION_MAX_FUTURE_MS = Number(process.env.LOCATION_MAX_FUTURE_MS) || 5 * 1000; // 서버 시계보다 5초 넘게 미래면 거절 (기기 시계 오류)
+const LOCATION_REPLAY_MAX_MS = Number(process.env.LOCATION_REPLAY_MAX_MS) || 60 * 1000; // join 때 다른 차의 마지막 위치를 몇 초 전 것까지 보내줄지
+const MOVING_SPEED_MPS = 1.0; // 이 속도(m/s, 약 3.6km/h) 이상일 때 받은 방향만 "믿을 수 있는 방향"으로 저장
+
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v); // "37.5" 같은 문자열 숫자, NaN, Infinity는 거절
+
+// data 검사: { error } 또는 { value }. 알려진 칸만 골라 담는다
+function validateLocation(data, now) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    return { error: 'BAD_LOCATION', message: 'data는 { "lat": 37.5, "lng": 127.0, "timestamp": 1700000000000 } 형태여야 합니다' };
+  }
+  const { lat, lng, heading, speed, accuracy, timestamp } = data;
+  if (!isNum(lat) || lat < -90 || lat > 90) return { error: 'BAD_LOCATION', message: 'lat은 -90~90 숫자여야 합니다' };
+  if (!isNum(lng) || lng < -180 || lng > 180) return { error: 'BAD_LOCATION', message: 'lng은 -180~180 숫자여야 합니다' };
+  // (0, 0)은 GPS를 못 잡은 앱이 기본값을 그대로 보낸 경우가 대부분이다
+  if (lat === 0 && lng === 0) return { error: 'BAD_LOCATION', message: '위치가 (0, 0)입니다. GPS를 잡은 뒤 보내세요' };
+  // heading·speed·accuracy는 없을 수 있다(정지 중이면 방향이 없음). 없으면 null로 보낸다
+  if (heading != null && (!isNum(heading) || heading < 0 || heading >= 360)) {
+    return { error: 'BAD_LOCATION', message: 'heading은 0 이상 360 미만 숫자 또는 null이어야 합니다' };
+  }
+  if (speed != null && (!isNum(speed) || speed < 0 || speed > 100)) {
+    return { error: 'BAD_LOCATION', message: 'speed는 0~100(m/s) 숫자 또는 null이어야 합니다' };
+  }
+  if (accuracy != null && (!isNum(accuracy) || accuracy < 0)) {
+    return { error: 'BAD_LOCATION', message: 'accuracy는 0 이상 숫자(m) 또는 null이어야 합니다' };
+  }
+  if (!isNum(timestamp)) return { error: 'BAD_LOCATION', message: 'timestamp(측정 시각, 밀리초)가 필요합니다' };
+  // 초 단위(10자리)로 보내면 "오래된 위치"로 오해하기 쉬워서 따로 알려준다. 1e12 ms = 2001년
+  if (timestamp < 1e12) return { error: 'BAD_LOCATION', message: 'timestamp는 초가 아니라 밀리초여야 합니다 (System.currentTimeMillis / Location.getTime)' };
+  if (now - timestamp > LOCATION_MAX_AGE_MS) {
+    return { error: 'LOCATION_TOO_OLD', message: `측정한 지 ${LOCATION_MAX_AGE_MS / 1000}초가 넘은 위치입니다` };
+  }
+  if (timestamp - now > LOCATION_MAX_FUTURE_MS) {
+    return { error: 'LOCATION_FROM_FUTURE', message: '측정 시각이 서버 시각보다 미래입니다. 기기 시계를 확인하세요' };
+  }
+  return {
+    value: {
+      lat, lng,
+      heading: heading ?? null,
+      speed: speed ?? null,
+      accuracy: accuracy ?? null,
+      measuredAt: timestamp, // 앱 기기 시계 기준
+      receivedAt: now,       // 서버 시계 기준. "최근 위치인지" 판단은 이 값으로 한다 (기기 시계 차이 영향 없음)
+    },
+  };
+}
+
+function locationMessage(groupId, vehicle) {
+  const { lat, lng, heading, speed, accuracy, measuredAt, receivedAt } = vehicle.location;
+  return {
+    type: 'vehicle_location_updated',
+    groupId,
+    vehicleId: vehicle.vehicleId,
+    vehicleName: vehicle.vehicleName,
+    data: { lat, lng, heading, speed, accuracy, measuredAt, receivedAt },
+  };
+}
+
+function handleLocation(ws, msg) {
+  if (!ws.groupId) return sendError(ws, 'NOT_JOINED', '먼저 join으로 동행에 연결하세요');
+  if (msg.vehicleId !== undefined && msg.vehicleId !== ws.vehicleId) {
+    return sendError(ws, 'BAD_LOCATION', '다른 차량의 위치는 보낼 수 없습니다');
+  }
+  const now = Date.now();
+  // 1초 단위로 센다. 넘치면 저장하지 않고 버리고, 에러는 그 1초 동안 한 번만 보낸다 (에러 도배 방지)
+  if (!ws.locRate || now - ws.locRate.start >= 1000) ws.locRate = { start: now, count: 0, warned: false };
+  if (++ws.locRate.count > LOCATION_MAX_PER_SEC) {
+    if (!ws.locRate.warned) {
+      ws.locRate.warned = true;
+      sendError(ws, 'RATE_LIMITED', `위치는 1초에 ${LOCATION_MAX_PER_SEC}번까지만 받습니다`);
+    }
+    return;
+  }
+
+  const checked = validateLocation(msg.data, now);
+  if (checked.error) return sendError(ws, checked.error, checked.message);
+
+  const group = groups.get(ws.groupId);
+  const vehicle = group && group.vehicles.get(ws.vehicleId);
+  if (!vehicle) return sendError(ws, 'NOT_A_MEMBER', '동행에 참가한 차량이 아닙니다');
+
+  // 늦게 도착한 옛 위치가 새 위치를 덮어쓰지 않게
+  if (vehicle.location && checked.value.measuredAt < vehicle.location.measuredAt) return;
+
+  vehicle.location = checked.value;
+  // 움직이는 중에 받은 방향만 따로 기억한다. 정지 중 방향은 0이나 엉뚱한 값일 수 있어서 위험 판정에 쓰지 않는다
+  // speed가 없으면 움직이는지 알 수 없지만, 방향이 함께 왔다면 이동 중으로 본다 (가정)
+  const v = checked.value;
+  if (v.heading !== null && (v.speed === null || v.speed >= MOVING_SPEED_MPS)) {
+    vehicle.lastMovingHeading = { heading: v.heading, receivedAt: now };
+  }
+  broadcastExcept(ws.groupId, ws, locationMessage(ws.groupId, vehicle));
+}
+
 // 이 연결을 지금 동행의 알림 대상에서 빼기 (방을 바꾸거나, 나가거나, 끊길 때)
 function detach(ws) {
   const set = sockets.get(ws.groupId);
@@ -290,11 +389,23 @@ function handleMessage(ws, raw) {
     for (const v of group.vehicles.values()) {
       if (v.vehicleId !== ws.vehicleId && v.status) send(ws, statusMessage(ws.groupId, v));
     }
+    // 다른 차들의 마지막 위치도 보낸다. 너무 오래된 위치(기본 60초)는 지도에 엉뚱하게 찍히므로 보내지 않는다
+    // 앱은 data.receivedAt으로 몇 초 전 위치인지 표시할 수 있다
+    const now = Date.now();
+    for (const v of group.vehicles.values()) {
+      if (v.vehicleId !== ws.vehicleId && v.location && now - v.location.receivedAt <= LOCATION_REPLAY_MAX_MS) {
+        send(ws, locationMessage(ws.groupId, v));
+      }
+    }
     return;
   }
 
   if (msg.type === 'vehicle_status') {
     return handleVehicleStatus(ws, msg);
+  }
+
+  if (msg.type === 'location') {
+    return handleLocation(ws, msg);
   }
 
   if (msg.type === 'leave') {
