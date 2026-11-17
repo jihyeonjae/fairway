@@ -7,6 +7,7 @@ const path = require('path');
 const SUITES = [
   { file: 'e2e-test.js', env: {} },
   { file: 'expire-test.js', env: { CODE_TTL_MS: '2000' } },
+  { file: 'malformed-test.js', env: {} },
   { file: 'location-test.js', env: {} },
   { file: 'hazard-test.js', env: {} },
   { file: 'lifecycle-test.js', env: { DEBUG_STATS: '1' } },

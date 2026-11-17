@@ -27,7 +27,7 @@
   - 409 `DUPLICATE_NAME`: 같은 동행에 같은 이름이 이미 있을 때. 앞뒤 공백은 무시하고 비교 (`"2호차 "` = `"2호차"`)
 - vehicleName은 서버가 앞뒤 공백을 지운 값으로 저장한다
 - **앱은 참가 성공 시 받은 `groupId`·`vehicleId`를 로컬(SharedPreferences 등)에 저장한다.** 앱을 재시작하면 REST로 다시 참가하지 말고 저장한 값으로 WS `join`만 다시 보낸다 (같은 이름으로 REST 재참가하면 `DUPLICATE_NAME`)
-  - 400 `BAD_JSON`: 요청 본문이 JSON이 아닐 때 / 500 `SERVER_ERROR`: 서버 내부 오류 (제안)
+  - 400 `BAD_JSON`: 요청 본문이 JSON이 아닐 때 (`null`·숫자·문자열 본문 포함) / 413 `PAYLOAD_TOO_LARGE`: 본문 100KB 초과 / 500 `SERVER_ERROR`: 서버 내부 오류 (제안)
   - 404 `GROUP_NOT_FOUND`: GET /api/groups/:groupId 에서 없는 groupId (제안)
   - 410 `GROUP_ENDED`: GET /api/groups/:groupId 에서 종료된 동행 (종료 후 24시간까지 구분, 그 뒤엔 404)
   - 종료된 동행의 참가 코드는 404 `INVALID_CODE`. 30분 지나 정리된 코드는 24시간까지 410 `CODE_EXPIRED`
@@ -121,13 +121,35 @@
 - 숫자(3초, 5분, 1.5km, 45°, 60°, 100m, 10분)는 전부 가정값. 환경변수: `HAZARD_TTL_MS`, `HAZARD_ALERT_RADIUS_M`, `HAZARD_DEDUP_RADIUS_M`, `FRESH_LOCATION_MS`, `HAZARD_PENDING_MS`, `SOURCE_HEADING_MAX_AGE_MS`
 - 자동 테스트: `server/hazard-test.js`
 
-- 자동 테스트: `server/e2e-test.js` (전체), `server/expire-test.js` (코드 만료, 서버를 `CODE_TTL_MS=2000`으로 켜고 실행)
+### 동행 종료·나가기 (11.17 추가)
+- **호스트 종료**: 호스트가 `{"type":"end_group"}`. 호스트가 아니면 `NOT_HOST`
+- **자동 종료**: 동행을 만든 지 12시간이 지나면 서버가 끝낸다 (`reason:"EXPIRED"`). 1분마다 정리하고, 그 사이에 요청이 오면 그 자리에서 끝낸다
+- 끝나면 연결된 모든 앱에 `group_ended`를 보내고 **close 코드 4001**로 끊는다
+- **끝날 때 서버에서 지우는 것**: 동행·차량 명단, 참가 코드(코드 찾기 목록 포함), 각 차의 위치·이동 방향, 위험 기록과 "이미 알린 차" 기록, 실시간 연결 목록. 남는 건 "종료됨" 안내용 groupId와 끝난 시각뿐이고 24시간 뒤 지운다
+- **참가자 나가기**: 참가자가 `{"type":"leave_group"}` → 그 차에 `left_group`, 남은 차들에 새 `group_state`. 그 차의 위치·이동 방향이 지워지고, 그 차가 낸 위험도 지워져 `hazard_cleared`가 간다. 자리가 비므로 같은 이름으로 다시 참가할 수 있다. 호스트는 `HOST_CANNOT_LEAVE` → 종료를 써야 한다
+- 기존 `leave`는 그대로다 (알림만 끊고 명단엔 남음). 화면만 닫을 땐 `leave`, 동행에서 빠질 땐 `leave_group`
+- 참가 코드는 30분이 지나면 정리 작업이 코드 찾기 목록에서 지운다. 그 뒤 24시간 동안은 `CODE_EXPIRED`, 그 뒤엔 `INVALID_CODE`
+
+**앱이 할 일**
+- `group_ended` 또는 close 코드 4001을 받으면: **자동 재연결하지 않는다**, 저장해 둔 groupId·vehicleId를 지운다, "동행이 종료되었습니다"를 안내하고 첫 화면으로 간다
+- 앱을 다시 켰을 때 저장된 ID로 `join`했는데 `GROUP_ENDED`가 오면: 위와 같이 처리 (앱이 꺼져 있는 동안 동행이 끝난 경우)
+- `left_group`을 받으면: 저장한 ID를 지우고 첫 화면으로
+- 종료 버튼은 호스트 화면에만 둔다 (`NOT_HOST`가 사용자 눈에 뜨지 않게)
+
+- 숫자(12시간, 1분, 24시간)는 가정값. 환경변수 `GROUP_TTL_MS`, `SWEEP_INTERVAL_MS`, `TOMBSTONE_TTL_MS`
+- 자동 테스트: `server/lifecycle-test.js`, `server/lifecycle-expire-test.js`
+
+### 테스트 실행
+- **`server` 폴더에서 `npm test`** → 테스트 묶음마다 필요한 설정으로 서버를 따로 켜서(3901번 포트부터) 전부 돌린다. 켜 둔 3000번 서버와 겹치지 않는다
+- 테스트용 `GET /debug/stats`(메모리에 남은 데이터 개수)는 서버를 `DEBUG_STATS=1`로 켰을 때만 열린다
+- 개별 실행: `server/e2e-test.js` (전체), `server/expire-test.js` (코드 만료, 서버를 `CODE_TTL_MS=2000`으로 켜고 실행)
 - 수동 테스트: `server/ws-test.js` (`node ws-test.js <groupId> <vehicleId>`, ID는 REST 응답값). 연결 후 `r`/`n`/`w 코드`/`{JSON}`/`leave` 입력. 다른 PC면 `WS_URL=ws://<IP>:3000 node ws-test.js <groupId> <vehicleId>`
 
 ## 서버 저장
 1차는 서버 메모리(Map)에 저장. 서버를 끄면 사라진다. DB·배포는 1차 범위 밖.
-- `Group { groupId, inviteCode, createdAt, hostVehicleId, vehicles: Map<vehicleId, {vehicleId, vehicleName, status, location, lastMovingHeading}> }`
+- `Group { groupId, inviteCode, createdAt, hostVehicleId, vehicles: Map<vehicleId, {vehicleId, vehicleName, status, location, lastMovingHeading, pendingHazard}>, hazards: Map<hazardId, {..., notified: Set<vehicleId>}> }`
 - `inviteCode → groupId` 인덱스, `groupId → Set<WebSocket>` 연결 목록
+- 종료 안내용: `endedGroups`(groupId → 끝난 시각), `expiredCodes`(코드 → 만료 처리 시각). 개인 데이터 없음, 24시간 뒤 삭제
 
 ---
 

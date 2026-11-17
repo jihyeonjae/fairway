@@ -150,6 +150,10 @@ app.use((err, req, res, next) => {
   if (err.type === 'entity.parse.failed') {
     return res.status(400).json({ error: 'BAD_JSON', message: 'JSON 형식이 아닙니다' });
   }
+  // express.json 기본 한도(100KB)를 넘는 본문. 서버 고장이 아니라 요청 문제라 500이 아닌 413으로 답한다
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'PAYLOAD_TOO_LARGE', message: '요청 본문이 너무 큽니다 (최대 100KB)' });
+  }
   console.error('[REST 에러]', err);
   res.status(500).json({ error: 'SERVER_ERROR', message: '서버 처리 중 오류가 났습니다' });
 });
